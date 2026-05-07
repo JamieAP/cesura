@@ -729,6 +729,40 @@ mod tests {
     }
 
     #[test]
+    fn nig_predictive_variance_matches_closed_form() {
+        // Catches a wrong (df, scale) in log_predictive that the normalization
+        // test cannot. Posterior predictive is Student-t(df=2α, μ, scale²);
+        // its variance is β(κ+1)/(κ(α-1)) for α > 1.
+        for &(kappa, alpha, beta) in &[(2.0, 3.0, 1.0), (5.0, 10.0, 4.0), (1.0, 2.5, 0.7)] {
+            let nig = Nig {
+                mu: 0.5,
+                kappa,
+                alpha,
+                beta,
+            };
+            let expected_var = beta * (kappa + 1.0) / (kappa * (alpha - 1.0));
+
+            // ∫ (x − μ)² p(x) dx via wide trapezoidal grid.
+            let n = 100_000;
+            let (a, b) = (-200.0_f64, 200.0_f64);
+            let dx = (b - a) / n as f64;
+            let mut second_moment = 0.0;
+            for i in 0..=n {
+                let x = a + i as f64 * dx;
+                let w = if i == 0 || i == n { 0.5 } else { 1.0 };
+                second_moment += w * (x - nig.mu).powi(2) * nig.log_predictive(x).exp() * dx;
+            }
+            // Heavy-tail truncation costs us a few percent -- but a wrong (df, scale)
+            // would be off by an O(1) factor.
+            let rel_err = (second_moment - expected_var).abs() / expected_var;
+            assert!(
+                rel_err < 0.05,
+                "predictive variance: got {second_moment}, expected {expected_var} (κ={kappa}, α={alpha}, β={beta})"
+            );
+        }
+    }
+
+    #[test]
     fn nig_predictive_is_a_proper_density_post_update() {
         // After 200 observations from N(5, 0.5²), the predictive should still
         // integrate to 1 (now centered near 5, much narrower).
