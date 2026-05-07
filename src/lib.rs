@@ -157,6 +157,14 @@ impl BocpdDetector {
     /// is reported. The confidence is 1 - (map_rl / t).
     ///
     /// Returns an empty vec if `data` has fewer than 20 elements.
+    ///
+    /// # Heuristic constants
+    ///
+    /// The MAP-drop detector uses three hand-tuned constants -- `drop_to=3`,
+    /// `min_prev_rl=30`, `cooldown=15` -- that gate when a run-length drop
+    /// is reported as a change point. They are not from Adams & MacKay (2007);
+    /// the underlying BOCPD recursion (NIG predictive, log-space update) is.
+    /// Tests verify the math; these constants are tuned against the eval suite.
     pub fn detect(&self, data: &[f64], threshold: f64) -> Vec<ChangePoint> {
         // Filter NaN/infinite values, keeping a map back to original indices
         let mut original_indices: Vec<usize> = Vec::new();
@@ -634,6 +642,136 @@ mod tests {
         let at_10 = nig.log_predictive(10.0);
         assert!(at_5 > at_0);
         assert!(at_5 > at_10);
+    }
+
+    // ── NIG: closed-form posterior equivalence ────────────────────────
+
+    /// Closed-form NIG posterior given prior (μ₀, κ₀, α₀, β₀) and data {x_i}.
+    ///
+    /// Reference: Murphy (2012) §3.3 / §4.6, conjugate analysis for normal
+    /// with unknown mean and variance.
+    fn closed_form_nig(prior: &Nig, data: &[f64]) -> Nig {
+        let n = data.len() as f64;
+        let kappa_n = prior.kappa + n;
+        let mean = data.iter().sum::<f64>() / n;
+        let mu_n = (prior.kappa * prior.mu + n * mean) / kappa_n;
+        let alpha_n = prior.alpha + n / 2.0;
+        let ssq = data.iter().map(|x| (x - mean).powi(2)).sum::<f64>();
+        let beta_n = prior.beta
+            + 0.5 * ssq
+            + prior.kappa * n * (mean - prior.mu).powi(2) / (2.0 * kappa_n);
+        Nig {
+            mu: mu_n,
+            kappa: kappa_n,
+            alpha: alpha_n,
+            beta: beta_n,
+        }
+    }
+
+    #[test]
+    fn nig_iterative_update_matches_closed_form() {
+        let prior = Nig {
+            mu: 0.5,
+            kappa: 2.0,
+            alpha: 3.0,
+            beta: 4.0,
+        };
+        let mut rng = Rng::new(20251);
+        let data: Vec<f64> = (0..500).map(|_| rng.normal(2.0, 1.5)).collect();
+
+        let online = data.iter().fold(prior.clone(), |acc, &x| acc.update(x));
+        let offline = closed_form_nig(&prior, &data);
+
+        // Tight: this is pure floating-point algebra, no Monte-Carlo.
+        assert!(
+            (online.mu - offline.mu).abs() < 1e-10,
+            "μ: online={}, closed-form={}",
+            online.mu,
+            offline.mu
+        );
+        assert!((online.kappa - offline.kappa).abs() < 1e-10);
+        assert!((online.alpha - offline.alpha).abs() < 1e-10);
+        // β accumulates rounding error -- looser bound, still ≪ value scale.
+        assert!(
+            (online.beta - offline.beta).abs() < 1e-6,
+            "β: online={}, closed-form={}",
+            online.beta,
+            offline.beta
+        );
+    }
+
+    /// Numerical integration of exp(NIG.log_predictive) over a wide grid.
+    /// The posterior predictive is a Student-t; integral over ℝ should be 1.
+    fn integrate_predictive(nig: &Nig, a: f64, b: f64, n: usize) -> f64 {
+        let dx = (b - a) / n as f64;
+        let mut s = 0.0;
+        for i in 0..=n {
+            let x = a + i as f64 * dx;
+            let w = if i == 0 || i == n { 0.5 } else { 1.0 };
+            s += w * nig.log_predictive(x).exp() * dx;
+        }
+        s
+    }
+
+    #[test]
+    fn nig_predictive_is_a_proper_density_at_prior() {
+        let prior = Nig {
+            mu: 0.0,
+            kappa: 1.0,
+            alpha: 2.0, // df = 4 → finite mean and variance
+            beta: 1.0,
+        };
+        let mass = integrate_predictive(&prior, -100.0, 100.0, 50_000);
+        assert!(
+            (mass - 1.0).abs() < 0.01,
+            "prior predictive mass = {mass}, expected ≈ 1.0"
+        );
+    }
+
+    #[test]
+    fn nig_predictive_is_a_proper_density_post_update() {
+        // After 200 observations from N(5, 0.5²), the predictive should still
+        // integrate to 1 (now centered near 5, much narrower).
+        let mut nig = Nig {
+            mu: 0.0,
+            kappa: 1.0,
+            alpha: 1.0,
+            beta: 1.0,
+        };
+        let mut rng = Rng::new(404);
+        for _ in 0..200 {
+            nig = nig.update(rng.normal(5.0, 0.5));
+        }
+        let mass = integrate_predictive(&nig, -50.0, 60.0, 50_000);
+        assert!(
+            (mass - 1.0).abs() < 0.01,
+            "posterior predictive mass = {mass}, expected ≈ 1.0"
+        );
+    }
+
+    // ── Affine invariance of detection ────────────────────────────────
+
+    #[test]
+    fn detection_is_affine_invariant() {
+        // The detector normalizes input internally (subtract mean, divide by σ),
+        // so a positive affine transform y = a·x + b must produce identical
+        // change point indices.
+        let mut rng = Rng::new(13);
+        let mut x: Vec<f64> = (0..150).map(|_| rng.normal(0.0, 1.0)).collect();
+        x.extend((0..150).map(|_| rng.normal(3.0, 1.0)));
+
+        let det = BocpdDetector::new(200.0, 350);
+
+        let raw_cps: Vec<usize> = det.detect(&x, 0.3).iter().map(|c| c.index).collect();
+
+        for &(a, b) in &[(1.0, 100.0), (5.0, -50.0), (0.1, 7.0), (1000.0, 0.0)] {
+            let y: Vec<f64> = x.iter().map(|&v| a * v + b).collect();
+            let trans_cps: Vec<usize> = det.detect(&y, 0.3).iter().map(|c| c.index).collect();
+            assert_eq!(
+                raw_cps, trans_cps,
+                "affine (a={a}, b={b}) shifted CPs: raw={raw_cps:?}, transformed={trans_cps:?}"
+            );
+        }
     }
 
     // ── log_add_exp numerical stability ───────────────────────────────

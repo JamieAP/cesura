@@ -211,6 +211,144 @@ mod tests {
         assert!((quad - 1.0).abs() < 1e-10);
     }
 
+    /// Closed-form NIW posterior given prior and data.
+    /// Reference: Murphy (2012) §4.6.3.
+    fn closed_form_niw(prior: &Niw, data: &[Vec<f64>]) -> Niw {
+        let d = prior.d;
+        let n = data.len() as f64;
+        let kappa_n = prior.kappa + n;
+        let nu_n = prior.nu + n;
+
+        let mut xbar = vec![0.0; d];
+        for x in data {
+            for i in 0..d {
+                xbar[i] += x[i];
+            }
+        }
+        for v in xbar.iter_mut() {
+            *v /= n;
+        }
+
+        let mu_n: Vec<f64> = (0..d)
+            .map(|i| (prior.kappa * prior.mu[i] + n * xbar[i]) / kappa_n)
+            .collect();
+
+        let mut s = vec![0.0; d * d];
+        for x in data {
+            for i in 0..d {
+                for j in 0..d {
+                    s[i * d + j] += (x[i] - xbar[i]) * (x[j] - xbar[j]);
+                }
+            }
+        }
+
+        let factor = prior.kappa * n / kappa_n;
+        let mut psi_n = prior.psi.clone();
+        for i in 0..d {
+            for j in 0..d {
+                psi_n[i * d + j] +=
+                    s[i * d + j] + factor * (xbar[i] - prior.mu[i]) * (xbar[j] - prior.mu[j]);
+            }
+        }
+
+        Niw {
+            d,
+            mu: mu_n,
+            kappa: kappa_n,
+            nu: nu_n,
+            psi: psi_n,
+        }
+    }
+
+    fn rng_next(s: &mut [u64; 4]) -> u64 {
+        let r = (s[1].wrapping_mul(5)).rotate_left(7).wrapping_mul(9);
+        let t = s[1] << 17;
+        s[2] ^= s[0];
+        s[3] ^= s[1];
+        s[1] ^= s[2];
+        s[0] ^= s[3];
+        s[2] ^= t;
+        s[3] = s[3].rotate_left(45);
+        r
+    }
+
+    fn rng_normal(state: &mut [u64; 4], mean: f64, std: f64) -> f64 {
+        let u = |s: &mut [u64; 4]| -> f64 { (rng_next(s) >> 11) as f64 / (1u64 << 53) as f64 };
+        let u1 = u(state).max(1e-300);
+        let u2 = u(state);
+        let z = (-2.0 * u1.ln()).sqrt() * (2.0 * PI * u2).cos();
+        mean + std * z
+    }
+
+    fn rng_seed(seed: u64) -> [u64; 4] {
+        let mut s = seed;
+        let mut state = [0u64; 4];
+        for slot in &mut state {
+            s = s.wrapping_add(0x9e3779b97f4a7c15);
+            let mut z = s;
+            z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111eb);
+            *slot = z ^ (z >> 31);
+        }
+        state
+    }
+
+    #[test]
+    fn niw_iterative_update_matches_closed_form_d2() {
+        let prior = Niw::new(2);
+        let mut rng = rng_seed(2024);
+        let data: Vec<Vec<f64>> = (0..400)
+            .map(|_| {
+                vec![
+                    rng_normal(&mut rng, 1.5, 1.0),
+                    rng_normal(&mut rng, -0.5, 2.0),
+                ]
+            })
+            .collect();
+
+        let online = data.iter().fold(prior.clone(), |acc, x| acc.update(x));
+        let offline = closed_form_niw(&prior, &data);
+
+        assert!((online.kappa - offline.kappa).abs() < 1e-10);
+        assert!((online.nu - offline.nu).abs() < 1e-10);
+        for i in 0..2 {
+            assert!(
+                (online.mu[i] - offline.mu[i]).abs() < 1e-10,
+                "μ[{i}]: online={}, closed-form={}",
+                online.mu[i],
+                offline.mu[i]
+            );
+        }
+        for i in 0..4 {
+            assert!(
+                (online.psi[i] - offline.psi[i]).abs() < 1e-5,
+                "Ψ[{i}]: online={}, closed-form={}",
+                online.psi[i],
+                offline.psi[i]
+            );
+        }
+    }
+
+    #[test]
+    fn niw_predictive_is_a_proper_density_d1() {
+        // At d=1, NIW prior (κ=1, ν=3, Ψ=1) ⇒ Student-t(df=3, μ=0, σ²=2/3).
+        // Integrate over wide grid -- should be ≈1.
+        let niw = Niw::new(1);
+        let n = 50_000;
+        let (a, b) = (-100.0_f64, 100.0_f64);
+        let dx = (b - a) / n as f64;
+        let mut mass = 0.0;
+        for i in 0..=n {
+            let x = a + i as f64 * dx;
+            let w = if i == 0 || i == n { 0.5 } else { 1.0 };
+            mass += w * niw.log_predictive(&[x]).exp() * dx;
+        }
+        assert!(
+            (mass - 1.0).abs() < 0.01,
+            "NIW d=1 prior predictive mass = {mass}, expected ≈ 1.0"
+        );
+    }
+
     #[test]
     fn niw_reduces_to_nig_for_d1() {
         // For d=1, NIW should behave like NIG

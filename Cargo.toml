@@ -18,3 +18,11 @@ serde = { version = "1", features = ["derive"] }
 
 [dev-dependencies]
 serde_json = "1"
+
+[[test]]
+name = "statistical"
+required-features = ["test-utils"]
+
+[[test]]
+name = "state_compat"
+required-features = ["test-utils"]
