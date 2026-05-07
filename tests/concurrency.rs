@@ -13,9 +13,9 @@
 use std::sync::Arc;
 use std::thread;
 
-use bocpd::eval::Rng;
-use bocpd::streaming::StreamingDetector;
-use bocpd::BocpdDetector;
+use cesura::eval::Rng;
+use cesura::streaming::StreamingDetector;
+use cesura::BocpdDetector;
 
 fn assert_send_sync<T: Send + Sync>() {}
 
@@ -24,8 +24,8 @@ fn detector_types_are_send_sync() {
     // Compile-time: removal of Send/Sync would fail the build, not just the test.
     assert_send_sync::<BocpdDetector>();
     assert_send_sync::<StreamingDetector>();
-    assert_send_sync::<bocpd::ChangePoint>();
-    assert_send_sync::<bocpd::streaming::DetectorState>();
+    assert_send_sync::<cesura::ChangePoint>();
+    assert_send_sync::<cesura::streaming::DetectorState>();
 }
 
 #[test]

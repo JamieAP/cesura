@@ -8,8 +8,8 @@
 //!
 //! Run with: `cargo test --features test-utils --test state_compat`.
 
-use bocpd::eval::Rng;
-use bocpd::streaming::{DetectorState, StreamingDetector};
+use cesura::eval::Rng;
+use cesura::streaming::{DetectorState, StreamingDetector};
 
 #[test]
 fn state_size_is_bounded_after_long_run() {

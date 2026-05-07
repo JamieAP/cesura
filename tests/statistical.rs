@@ -7,8 +7,8 @@
 //!
 //! Run with: `cargo test --features test-utils --test statistical`.
 
-use bocpd::eval::{self, Category, Rng};
-use bocpd::BocpdDetector;
+use cesura::eval::{self, Category, Rng};
+use cesura::BocpdDetector;
 
 // ── ARL₀: average run length to false alarm under H0 ─────────────────
 

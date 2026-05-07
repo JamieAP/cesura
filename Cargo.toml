@@ -1,10 +1,10 @@
 [package]
-name = "bocpd"
+name = "cesura"
 version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
 description = "Bayesian Online Change Point Detection (Adams & MacKay 2007) with NIG conjugate prior"
-repository = "https://github.com/JamieAP/bocpd"
+repository = "https://github.com/JamieAP/cesura"
 readme = "README.md"
 keywords = ["bayesian", "changepoint", "anomaly", "timeseries", "online"]
 categories = ["science", "mathematics", "algorithms"]

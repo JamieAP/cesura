@@ -7,9 +7,9 @@
 //!
 //! Run: `cargo test --features test-utils --test correctness`.
 
-use bocpd::eval::Rng;
-use bocpd::streaming::StreamingDetector;
-use bocpd::BocpdDetector;
+use cesura::eval::Rng;
+use cesura::streaming::StreamingDetector;
+use cesura::BocpdDetector;
 
 #[test]
 fn multivariate_d1_agrees_with_univariate_on_clean_shift() {
@@ -87,7 +87,7 @@ fn streaming_resume_is_observationally_equivalent() {
     let mut det_b = StreamingDetector::new(200.0, 350);
     let mut cps_b = det_b.step(&pre, 0.3);
     let json = serde_json::to_string(&det_b.save_state()).unwrap();
-    let restored: bocpd::streaming::DetectorState = serde_json::from_str(&json).unwrap();
+    let restored: cesura::streaming::DetectorState = serde_json::from_str(&json).unwrap();
     let mut det_b2 = StreamingDetector::restore(restored).unwrap();
     cps_b.extend(det_b2.step(&post, 0.3));
 

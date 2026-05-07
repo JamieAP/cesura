@@ -5,9 +5,9 @@
 //!
 //! Run: `cargo test --features test-utils --test resilience`.
 
-use bocpd::eval::Rng;
-use bocpd::streaming::{DetectorState, NigState, StreamingDetector, WelfordState};
-use bocpd::BocpdDetector;
+use cesura::eval::Rng;
+use cesura::streaming::{DetectorState, NigState, StreamingDetector, WelfordState};
+use cesura::BocpdDetector;
 
 // ── Adversarial numerical inputs ─────────────────────────────────────
 

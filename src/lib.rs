@@ -8,7 +8,7 @@
 //! # Example
 //!
 //! ```
-//! use bocpd::{BocpdDetector, ChangePoint};
+//! use cesura::{BocpdDetector, ChangePoint};
 //!
 //! let data: Vec<f64> = std::iter::repeat(0.0).take(100)
 //!     .chain(std::iter::repeat(5.0).take(100))

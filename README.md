@@ -1,10 +1,10 @@
-# bocpd
+# cesura
 
-Bayesian Online Change Point Detection in Rust.
+> *Caesura -- a deliberate break in a line of verse, where the rhythm changes.*
 
-Implements Adams & MacKay (2007) with a Normal-Inverse-Gamma conjugate
-prior on the underlying Gaussian. Pure Rust, no `unsafe`, no runtime
-dependencies beyond `serde`.
+Bayesian Online Change Point Detection in Rust. Implements Adams &
+MacKay (2007) with a Normal-Inverse-Gamma conjugate prior. Pure Rust,
+no `unsafe`, no runtime dependencies beyond `serde`.
 
 ## What it does
 
@@ -20,7 +20,7 @@ prior on the post-change distribution.
 ## API at a glance
 
 ```rust
-use bocpd::{BocpdDetector, ChangePoint};
+use cesura::{BocpdDetector, ChangePoint};
 
 let data: Vec<f64> = std::iter::repeat(0.0).take(100)
     .chain(std::iter::repeat(5.0).take(100))
@@ -41,7 +41,7 @@ for cp in &cps {
 so you can checkpoint and resume:
 
 ```rust
-use bocpd::streaming::StreamingDetector;
+use cesura::streaming::StreamingDetector;
 
 let mut det = StreamingDetector::new(200.0, 1024);
 for chunk in incoming {
