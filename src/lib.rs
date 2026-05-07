@@ -297,14 +297,20 @@ impl BocpdDetector {
                         };
                         let shift_sigma = (mean_a - mean_b).abs();
 
-                        result.push(ChangePoint {
-                            index: original_indices[i],
-                            confidence,
-                            shift_sigma,
-                        });
-                        last_detection = i;
-                        i += cooldown;
-                        continue;
+                        // Phantom suppression: a "change" with no observable
+                        // before/after mean shift is a numerical artifact
+                        // (e.g., truncation at max_rl on a constant signal),
+                        // not a real regime change.
+                        if shift_sigma >= 1e-9 {
+                            result.push(ChangePoint {
+                                index: original_indices[i],
+                                confidence,
+                                shift_sigma,
+                            });
+                            last_detection = i;
+                            i += cooldown;
+                            continue;
+                        }
                     }
                 }
             }

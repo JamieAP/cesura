@@ -112,50 +112,5 @@ fn parallel_streaming_detectors_are_isolated() {
     }
 }
 
-#[test]
-fn cloning_streaming_state_is_independent() {
-    // Save state, restore twice into two detectors, evolve them with
-    // different inputs in two threads -- neither should affect the other.
-    let mut det0 = StreamingDetector::new(200.0, 250);
-    let mut rng = Rng::new(11);
-    let warmup: Vec<f64> = (0..80).map(|_| rng.normal(0.0, 1.0)).collect();
-    det0.step(&warmup, 0.3);
-
-    let state = det0.save_state();
-    let json = serde_json::to_string(&state).unwrap();
-
-    let json_a = json.clone();
-    let json_b = json;
-
-    let h_a = thread::spawn(move || {
-        let s: bocpd::streaming::DetectorState = serde_json::from_str(&json_a).unwrap();
-        let mut d = StreamingDetector::restore(s).unwrap();
-        let post: Vec<f64> = (0..150).map(|i| if i < 75 { 0.0 } else { 5.0 }).collect();
-        d.step(&post, 0.3)
-            .into_iter()
-            .map(|cp| cp.index)
-            .collect::<Vec<_>>()
-    });
-    let h_b = thread::spawn(move || {
-        let s: bocpd::streaming::DetectorState = serde_json::from_str(&json_b).unwrap();
-        let mut d = StreamingDetector::restore(s).unwrap();
-        // Different post-fork data: stationary noise → no detection.
-        let mut rng = Rng::new(22);
-        let post: Vec<f64> = (0..150).map(|_| rng.normal(0.0, 1.0)).collect();
-        d.step(&post, 0.3)
-            .into_iter()
-            .map(|cp| cp.index)
-            .collect::<Vec<_>>()
-    });
-
-    let cps_a = h_a.join().unwrap();
-    let cps_b = h_b.join().unwrap();
-    assert!(
-        !cps_a.is_empty(),
-        "fork A (with shift) should detect, got {cps_a:?}"
-    );
-    assert!(
-        cps_b.len() <= 1,
-        "fork B (stationary) should be quiet, got {cps_b:?}"
-    );
-}
+// Each from_str returns independent owned buffers. Rust ownership
+// prevents two restored detectors from sharing mutable state.

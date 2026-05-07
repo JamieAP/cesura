@@ -50,24 +50,20 @@ fn all_zeros_returns_no_detection() {
 }
 
 #[test]
-fn max_rl_smaller_than_data_produces_phantom_at_boundary() {
-    // Documents a known sharp edge: when max_run_length < data.len(), the
-    // run-length distribution truncates and probability mass leaks at the
-    // top, producing a phantom change point near t = max_rl with high
-    // confidence but `shift_sigma = 0.0`.
-    //
-    // This violates the documented contract on `BocpdDetector::new`. The
-    // test exists so that any future change to the truncation behavior
-    // is intentional, not silent.
+fn max_rl_truncation_does_not_emit_phantom_cp() {
+    // Regression test for a numerical artifact: when max_rl < data.len(),
+    // probability mass leaks at the top of the run-length distribution and
+    // would produce a "change point" at t ≈ max_rl on a constant signal --
+    // high confidence, zero observed shift. detect() now suppresses any
+    // CP with shift_sigma < 1e-9 because no real regime change can have
+    // identical before/after means.
     let data = vec![0.0; 300];
-    let det = BocpdDetector::new(200.0, 250);
+    let det = BocpdDetector::new(200.0, 250); // intentionally < data.len()
     let cps = det.detect(&data, 0.3);
-    if let Some(cp) = cps.first() {
-        // The phantom shows up at or just past max_rl, with shift_sigma=0
-        // because the underlying signal is constant.
-        assert!(cp.shift_sigma == 0.0);
-        assert!((cp.index as i64 - 250).abs() < 20);
-    }
+    assert!(
+        cps.is_empty(),
+        "phantom CP from max_rl truncation leaked: {cps:?}"
+    );
 }
 
 #[test]
@@ -100,13 +96,21 @@ fn max_rl_zero_does_not_panic() {
 
 #[test]
 fn data_length_at_minimum_threshold() {
-    // The implementation rejects data.len() < 20. Boundary: exactly 20 must work.
+    // Contract: detect() returns empty for data.len() < 20.
     let det = BocpdDetector::new(200.0, 50);
-    let data = vec![1.0; 20];
-    let _ = det.detect(&data, 0.3);
-    let data = vec![1.0; 19];
-    let cps = det.detect(&data, 0.3);
-    assert!(cps.is_empty(), "len=19 must be rejected (returns empty)");
+
+    // len=19: rejected.
+    assert!(det.detect(&[1.0; 19], 0.3).is_empty());
+
+    // len=20: accepted, but the heuristic needs ≥ min_prev_rl=30 to fire.
+    // So at len=20 there can be no detection regardless of input.
+    assert!(det.detect(&[1.0; 20], 0.3).is_empty());
+    let mut shifted = vec![0.0; 10];
+    shifted.extend(vec![10.0; 10]);
+    assert!(
+        det.detect(&shifted, 0.3).is_empty(),
+        "len=20 cannot fire -- under min_prev_rl warmup"
+    );
 }
 
 #[test]
@@ -182,8 +186,9 @@ fn state_with_nan_in_nig_does_not_propagate_silently() {
         0.3,
     );
     let mut state = det.save_state();
-    // Corrupt the active NIG slot.
-    if let Some(s) = state.stats.get_mut(5) {
+    // Corrupt EVERY NIG slot -- guarantees the active MAP slot is poisoned
+    // regardless of where the run-length distribution sits.
+    for s in &mut state.stats {
         *s = NigState {
             mu: f64::NAN,
             kappa: f64::NAN,
