@@ -810,6 +810,47 @@ mod tests {
 
     // ── log_add_exp numerical stability ───────────────────────────────
 
+    // ── log_add_exp algebraic properties ──────────────────────────────
+
+    #[test]
+    fn log_add_exp_is_commutative() {
+        let pairs = [
+            (-0.5, -0.5),
+            (10.0, -10.0),
+            (1e-9, 1e9),
+            (-1e9, 1e-9),
+            (700.0, 700.0),
+            (-700.0, 0.0),
+        ];
+        for (a, b) in pairs {
+            let ab = log_add_exp(a, b);
+            let ba = log_add_exp(b, a);
+            assert!(
+                (ab - ba).abs() < 1e-12,
+                "log_add_exp not commutative at ({a}, {b}): {ab} vs {ba}"
+            );
+        }
+    }
+
+    #[test]
+    fn log_add_exp_is_associative() {
+        // log_add_exp(log_add_exp(a, b), c) == log_add_exp(a, log_add_exp(b, c))
+        let triples = [
+            (0.0, 0.0, 0.0),
+            (-1.0, -2.0, -3.0),
+            (100.0, -100.0, 50.0),
+            (1e-3, 2e-3, 3e-3),
+        ];
+        for (a, b, c) in triples {
+            let lhs = log_add_exp(log_add_exp(a, b), c);
+            let rhs = log_add_exp(a, log_add_exp(b, c));
+            assert!(
+                (lhs - rhs).abs() < 1e-10,
+                "log_add_exp not associative at ({a}, {b}, {c}): {lhs} vs {rhs}"
+            );
+        }
+    }
+
     #[test]
     fn log_add_exp_identity() {
         assert_eq!(log_add_exp(f64::NEG_INFINITY, 5.0), 5.0);

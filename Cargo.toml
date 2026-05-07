@@ -26,3 +26,15 @@ required-features = ["test-utils"]
 [[test]]
 name = "state_compat"
 required-features = ["test-utils"]
+
+[[test]]
+name = "correctness"
+required-features = ["test-utils"]
+
+[[test]]
+name = "concurrency"
+required-features = ["test-utils"]
+
+[[test]]
+name = "resilience"
+required-features = ["test-utils"]

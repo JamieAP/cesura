@@ -497,6 +497,39 @@ mod tests {
     }
 
     #[test]
+    fn welford_matches_batch_stats() {
+        // Streaming Welford must converge to the population mean and
+        // population std (not sample std) within machine ε after N updates.
+        // Use a fixed-seed sequence; population sigma = 2.0, mu = 7.0.
+        let mut rng = crate::eval::Rng::new(31_337);
+        let data: Vec<f64> = (0..2000).map(|_| rng.normal(7.0, 2.0)).collect();
+
+        let mut w = WelfordState::new();
+        for &x in &data {
+            w.update(x);
+        }
+
+        let n = data.len() as f64;
+        let batch_mean = data.iter().sum::<f64>() / n;
+        let batch_var = data.iter().map(|x| (x - batch_mean).powi(2)).sum::<f64>() / n;
+        let batch_std = batch_var.sqrt();
+
+        // Population stats -- should match exactly (modulo float reorder).
+        assert!(
+            (w.mean - batch_mean).abs() < 1e-10,
+            "welford mean drifted: {} vs {}",
+            w.mean,
+            batch_mean
+        );
+        assert!(
+            (w.std() - batch_std).abs() < 1e-10,
+            "welford std drifted: {} vs {}",
+            w.std(),
+            batch_std
+        );
+    }
+
+    #[test]
     fn welford_online_stats() {
         let mut w = WelfordState::new();
         for x in [2.0, 4.0, 4.0, 4.0, 5.0, 5.0, 7.0, 9.0] {
