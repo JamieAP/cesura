@@ -77,8 +77,8 @@ input positions.
 
 - Adams, R. P., & MacKay, D. J. C. (2007). *Bayesian Online Changepoint
   Detection.* arXiv:0710.3742.
-- Chen, Z., & Wu, Y. (2025). *Post-hoc collective anomaly
-  classification.* arXiv:2508.06385.
+- Page, E. S. (1954). *Continuous Inspection Schemes.* Biometrika 41(1).
+  [CUSUM, used as a baseline in `tests/statistical.rs`.]
 
 ## License
 

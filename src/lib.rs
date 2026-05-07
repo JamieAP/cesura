@@ -2,8 +2,9 @@
 //! Bayesian Online Change Point Detection (Adams & MacKay 2007)
 //! with Normal-Inverse-Gamma conjugate prior.
 //!
-//! Extended with post-hoc collective anomaly classification
-//! per arXiv:2508.06385 (Chen & Wu 2025).
+//! Collective anomalies -- a temporary regime that returns to baseline --
+//! surface as a pair of detections (start + end) without any special-case
+//! handling. See `tests::detects_collective_anomaly`.
 //!
 //! # Example
 //!
