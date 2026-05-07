@@ -101,14 +101,13 @@ impl Detrender {
 
     /// Remove seasonal + trend components, returning residuals.
     ///
-    /// `start_offset` is the position within the period where `data` begins
-    /// (e.g., minute-of-day for daily detrending).
     pub fn detrend(&self, data: &[f64], start_offset: usize) -> Vec<f64> {
         data.iter()
             .enumerate()
             .map(|(i, &y)| {
-                let offset = (start_offset + i) % self.period;
-                y - self.seasonal[offset] - self.trend * i as f64 - self.intercept
+                let abs_pos = start_offset + i;
+                let offset = abs_pos % self.period;
+                y - self.seasonal[offset] - self.trend * abs_pos as f64 - self.intercept
             })
             .collect()
     }
@@ -242,6 +241,43 @@ fn median(sorted: &[f64]) -> f64 {
 mod tests {
     use super::*;
     use std::f64::consts::PI;
+
+    #[test]
+    fn detrend_continuation_subtracts_trend_at_correct_position() {
+        // Fit on [0..200], then detrend [200..400] of the SAME generative process.
+        // Residuals must be small. If `detrend()` uses the slice index `i` for
+        // trend subtraction (instead of absolute position since fit), the trend
+        // baseline for the continuation will be wrong by `trend * fit_len`.
+        let period = 60;
+        let trend = 0.1;
+        let amp = 3.0;
+        let full: Vec<f64> = (0..400)
+            .map(|i| trend * i as f64 + amp * (i as f64 * 2.0 * PI / period as f64).sin())
+            .collect();
+
+        let det = Detrender::fit(&full[..200], period);
+
+        // Sanity: detrending the FULL series should produce near-zero residuals.
+        let res_full = det.detrend(&full, 0);
+        let max_full = res_full.iter().map(|r| r.abs()).fold(0.0f64, f64::max);
+        assert!(
+            max_full < 2.0,
+            "full-series detrend max |r|={max_full:.2}"
+        );
+
+        // Now detrend the continuation [200..400] with start_offset=200.
+        // If `start_offset` is interpreted as absolute position since fit
+        // (correct contract), residuals are equally small. If it is only
+        // interpreted modulo period (current implementation), the trend
+        // baseline is wrong by `trend * 200 = 20`.
+        let res_cont = det.detrend(&full[200..], 200);
+        let max_cont = res_cont.iter().map(|r| r.abs()).fold(0.0f64, f64::max);
+        assert!(
+            max_cont < 2.0,
+            "continuation detrend max |r|={max_cont:.2} -- `start_offset` should \
+             control trend baseline as well as seasonal phase"
+        );
+    }
 
     #[test]
     fn fit_pure_sinusoid() {
