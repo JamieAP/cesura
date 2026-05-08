@@ -98,13 +98,11 @@ impl ScoreKind {
         }
     }
 
-    /// Default sum-CUSUM threshold for this score kind. Calibrated
-    /// against integration tests on `StreamingDetector`: fires on
-    /// dense ≥ 3σ shift, doesn't fire on 300-step stationary tape.
+    ///
     pub(crate) fn default_sum_cusum_threshold(self) -> f64 {
         match self {
             ScoreKind::BayesFactor => 20.0,
-            ScoreKind::CpProbability => 0.5,
+            ScoreKind::CpProbability => 0.1,
         }
     }
 }
