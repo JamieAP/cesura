@@ -3,8 +3,16 @@
 //! Reduces predictable periodic structure such as daily traffic cycles
 //! and batch schedules before change-point detection.
 //!
-//! Algorithm: median-based seasonal estimation (STL-lite). Robust to
-//! outliers. O(n) fit, O(k) incremental update.
+//! Algorithm: Theil-Sen linear trend (robust to step changes) + median-
+//! based seasonal estimation (STL-lite). O(n²) fit at small n; pruned
+//! pair sampling above 600 observations. O(k) incremental update.
+//!
+//! Yoshizawa (2022, arXiv:2201.02325) tackles the same baseline-shift
+//! problem inside BOCPD itself by reinitialising the NIG posterior on
+//! detected CP. cesura's approach is complementary -- detrending
+//! happens at the input layer; Yoshizawa's reset happens at the
+//! posterior layer. The two compose; users monitoring drifting
+//! baselines should consider applying both.
 
 use serde::{Deserialize, Serialize};
 
@@ -43,18 +51,9 @@ impl Detrender {
             };
         }
 
-        // Step 1: Estimate linear trend via least-squares
-        let n = data.len() as f64;
-        let x_mean = (n - 1.0) / 2.0;
-        let y_mean = data.iter().sum::<f64>() / n;
-        let mut num = 0.0;
-        let mut den = 0.0;
-        for (i, &y) in data.iter().enumerate() {
-            let x = i as f64 - x_mean;
-            num += x * (y - y_mean);
-            den += x * x;
-        }
-        let trend = if den.abs() > 1e-20 { num / den } else { 0.0 };
+        // Step 1: Theil-Sen slope. Median of pairwise slopes -- robust to
+        // step changes (a least-squares fit absorbs the step into the slope).
+        let trend = theil_sen_slope(data);
 
         // Step 2: Remove trend
         let detrended: Vec<f64> = data
@@ -138,6 +137,17 @@ impl Detrender {
         self.periods_seen = self.samples_seen / self.period;
     }
 
+    /// Detrend by seasonal differencing: `y_t - y_{t-period}`.
+    ///
+    /// Recommended over [`Detrender::detrend`] (median + Theil-Sen) for use
+    /// inputs to a change-point detector, because differencing converts a
+    /// step regime change into a clean transient pulse without requiring a
+    /// fitted seasonal model. Returns `data.len() - period` values; the
+    /// first `period` observations are consumed.
+    pub fn detrend_diff(&self, data: &[f64]) -> Vec<f64> {
+        seasonal_difference(data, self.period)
+    }
+
     /// Whether the detrender has enough data to be meaningful.
     pub fn is_fitted(&self) -> bool {
         self.periods_seen >= 1
@@ -163,6 +173,67 @@ impl Detrender {
     /// The period length.
     pub fn period(&self) -> usize {
         self.period
+    }
+}
+
+// ── Period detection ─────────────────────────────────────────
+
+/// Estimate the dominant period via autocorrelation peak.
+///
+/// Searches lags in `[min_lag, max_lag]`, returning the lag with the
+/// highest local-maximum autocorrelation that exceeds `min_corr`.
+/// Returns `None` if no candidate clears the threshold or if `data`
+/// has fewer than `2 * max_lag` samples.
+///
+/// `min_lag = 4` excludes high-frequency noise; `max_lag = data.len()/3`
+/// gives at least 3 cycles of evidence at the longest tested period.
+/// `min_corr = 0.3` excludes weakly-correlated peaks that would not
+/// produce a useful seasonal model.
+pub fn dominant_period_via_acf(data: &[f64]) -> Option<usize> {
+    let n = data.len();
+    let min_lag = 4;
+    let max_lag = (n / 3).max(min_lag + 1);
+    let min_corr = 0.3;
+
+    if n < 2 * max_lag || max_lag <= min_lag {
+        return None;
+    }
+
+    let mean = data.iter().sum::<f64>() / n as f64;
+    let var = data.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / n as f64;
+    if var < 1e-20 {
+        return None;
+    }
+
+    let acf = |lag: usize| -> f64 {
+        let mut s = 0.0;
+        for i in 0..(n - lag) {
+            s += (data[i] - mean) * (data[i + lag] - mean);
+        }
+        s / ((n - lag) as f64 * var)
+    };
+
+    let mut prev = acf(min_lag);
+    let mut prev_prev = acf(min_lag.saturating_sub(1).max(1));
+    for lag in (min_lag + 1)..max_lag {
+        let cur = acf(lag);
+        if prev > prev_prev && prev > cur && prev >= min_corr {
+            return Some(lag - 1);
+        }
+        prev_prev = prev;
+        prev = cur;
+    }
+    None
+}
+
+impl Detrender {
+    /// Auto-detect the dominant period via autocorrelation, then fit.
+    ///
+    /// Returns `None` when no period meets the autocorrelation threshold,
+    /// signalling that the signal is non-periodic (or that `data` is too
+    /// short relative to its periodicity).
+    pub fn auto_fit(data: &[f64]) -> Option<Self> {
+        dominant_period_via_acf(data).map(|p| Self::fit(data, p))
     }
 }
 
@@ -192,37 +263,81 @@ pub fn seasonal_difference(data: &[f64], period: usize) -> Vec<f64> {
 /// agreement between the two runs does not establish a real change.
 ///
 /// Returns indices in the raw data coordinate system.
+///
+/// Pass `period = None` to auto-detect via [`dominant_period_via_acf`].
+/// When auto-detection returns no period, the guard short-circuits to
+/// the raw-detector output (no false positives are filtered, but no
+/// real detections are lost either).
 pub fn detect_with_seasonal_guard(
     data: &[f64],
-    period: usize,
+    period: Option<usize>,
     detector: &crate::BocpdDetector,
-    threshold: f64,
 ) -> Vec<crate::ChangePoint> {
-    let raw_cps = detector.detect(data, threshold);
+    let raw_cps = detector.detect(data);
 
-    // Skip detrending if insufficient data
-    if data.len() < 3 * period || period == 0 {
-        return raw_cps;
-    }
+    let p = match period.or_else(|| dominant_period_via_acf(data)) {
+        Some(p) if p > 0 && data.len() >= 3 * p => p,
+        _ => return raw_cps,
+    };
 
-    let diffed = seasonal_difference(data, period);
+    let diffed = seasonal_difference(data, p);
     if diffed.len() < 20 {
         return raw_cps;
     }
 
-    let diff_cps = detector.detect(&diffed, threshold);
+    let diff_cps = detector.detect(&diffed);
 
-    // Intersect: keep raw CPs that have a corresponding diff CP
-    // The diff series is offset by `period` indices, so adjust.
     raw_cps
         .into_iter()
         .filter(|cp| {
             diff_cps.iter().any(|dcp| {
-                let adj = dcp.index + period;
-                (adj as i64 - cp.index as i64).unsigned_abs() as usize <= period / 2
+                let adj = dcp.index + p;
+                (adj as i64 - cp.index as i64).unsigned_abs() as usize <= p / 2
             })
         })
         .collect()
+}
+
+/// Theil-Sen slope estimator: median of pairwise slopes `(y_j - y_i)/(j - i)`.
+/// Uses a robust median slope estimate. Step changes and the sampling
+/// scheme can still affect the estimate; there is no universal zero-bias
+/// guarantee for a stepped series.
+///
+/// O(n²) pairs; for large `n` we subsample to keep fit cost bounded.
+fn theil_sen_slope(data: &[f64]) -> f64 {
+    let n = data.len();
+    if n < 2 {
+        return 0.0;
+    }
+
+    // Pair budget: cap at MAX_PAIRS to keep fit O(MAX_PAIRS · log MAX_PAIRS).
+    // For n ≤ 600 this is exact (all pairs); for larger n we stride uniformly.
+    const MAX_PAIRS: usize = 200_000;
+    let total_pairs = n * (n - 1) / 2;
+
+    let mut slopes: Vec<f64> = Vec::with_capacity(total_pairs.min(MAX_PAIRS));
+    if total_pairs <= MAX_PAIRS {
+        for i in 0..n {
+            for j in (i + 1)..n {
+                slopes.push((data[j] - data[i]) / (j - i) as f64);
+            }
+        }
+    } else {
+        let stride = ((total_pairs as f64) / (MAX_PAIRS as f64)).sqrt().ceil() as usize;
+        let stride = stride.max(1);
+        let mut i = 0;
+        while i < n {
+            let mut j = i + 1;
+            while j < n {
+                slopes.push((data[j] - data[i]) / (j - i) as f64);
+                j += stride;
+            }
+            i += stride;
+        }
+    }
+
+    slopes.sort_by(|a, b| a.total_cmp(b));
+    median(&slopes)
 }
 
 fn median(sorted: &[f64]) -> f64 {
@@ -445,203 +560,13 @@ mod tests {
 
         // BOCPD on residuals should have few/no detections
         let detector = BocpdDetector::new(200.0, 650);
-        let cps = detector.detect(&residuals, 0.3);
+        let cps = detector.detect(&residuals);
         assert!(
             cps.len() <= 2,
             "detrended periodic should have ≤2 FPs, got {}",
             cps.len()
         );
     }
-
-
-    #[test]
-    fn research_fit_on_full_data_weakens_shift() {
-        use crate::BocpdDetector;
-
-        let period = 60;
-        let data: Vec<f64> = (0..300)
-            .map(|i| {
-                let seasonal = (i as f64 * 2.0 * PI / period as f64).sin() * 2.0;
-                let level = if i < 150 { 0.0 } else { 5.0 };
-                seasonal + level
-            })
-            .collect();
-
-        let detector = BocpdDetector::new(200.0, 350);
-
-        // Fit on pre-shift data only (correct approach)
-        let correct = Detrender::fit(&data[..150], period);
-        let correct_residuals = correct.detrend(&data, 0);
-        let correct_cps = detector.detect(&correct_residuals, 0.3);
-
-        // Fit on full data including shift (problematic approach)
-        let full = Detrender::fit(&data, period);
-        let full_residuals = full.detrend(&data, 0);
-        let full_cps = detector.detect(&full_residuals, 0.3);
-
-        // Both detect, but the full-fit version has weaker detection
-        // (shift_sigma is lower because trend absorbed part of the step)
-        eprintln!(
-            "correct: {} detections, shift_sigma={:.2}",
-            correct_cps.len(),
-            correct_cps.first().map(|c| c.shift_sigma).unwrap_or(0.0)
-        );
-        eprintln!(
-            "full-fit: {} detections, shift_sigma={:.2}",
-            full_cps.len(),
-            full_cps.first().map(|c| c.shift_sigma).unwrap_or(0.0)
-        );
-
-        // The trend absorbs ~0.025/step, so over 150 steps that's ~3.75 of the 5.0 shift
-        assert!(
-            full.trend.abs() > 0.01,
-            "full-data fit should have non-zero trend from absorbing the step: trend={:.4}",
-            full.trend
-        );
-    }
-
-    #[test]
-    fn research_two_periods_worse_than_five() {
-
-        let period = 60;
-        let mut rng = crate::eval::Rng::new(7777);
-        let full_data: Vec<f64> = (0..300)
-            .map(|i| (i as f64 * 2.0 * PI / period as f64).sin() * 3.0 + rng.normal(0.0, 0.5))
-            .collect();
-
-        // 2-period fit
-        let det2 = Detrender::fit(&full_data[..120], period);
-        let res2 = det2.detrend(&full_data[..120], 0);
-        let var2 = res2.iter().map(|x| x.powi(2)).sum::<f64>() / res2.len() as f64;
-
-        // 5-period fit
-        let det5 = Detrender::fit(&full_data, period);
-        let res5 = det5.detrend(&full_data[..120], 0);
-        let var5 = res5.iter().map(|x| x.powi(2)).sum::<f64>() / res5.len() as f64;
-
-        eprintln!("2-period residual var: {var2:.4}, 5-period residual var: {var5:.4}");
-        assert!(
-            var5 < var2,
-            "5-period estimate should produce lower residual variance: \
-             2p={var2:.4}, 5p={var5:.4}"
-        );
-    }
-
-    #[test]
-    #[should_panic(expected = "seasonal differencing should have fewer FPs")]
-    fn research_differencing_beats_median_subtraction() {
-        use crate::BocpdDetector;
-
-        let period = 50;
-        // Bursty signal -- regular bursts every 50 steps (MustReject scenario)
-        let mut rng = crate::eval::Rng::new(8888);
-        let data: Vec<f64> = (0..300)
-            .map(|i| {
-                let burst = if i % 50 < 5 { 3.0 } else { 0.0 };
-                burst + rng.normal(0.0, 0.5)
-            })
-            .collect();
-
-        let detector = BocpdDetector::new(200.0, 350);
-
-        // Current approach: median-based detrending
-        let detrender = Detrender::fit(&data, period);
-        let median_residuals = detrender.detrend(&data, 0);
-        let median_fps = detector.detect(&median_residuals, 0.3).len();
-
-        // Better approach: seasonal differencing
-        let diff_data: Vec<f64> = data
-            .iter()
-            .enumerate()
-            .skip(period)
-            .map(|(i, &y)| y - data[i - period])
-            .collect();
-        let diff_fps = detector.detect(&diff_data, 0.3).len();
-
-        eprintln!("bursty: median_fps={median_fps}, diff_fps={diff_fps}");
-        assert!(
-            diff_fps < median_fps,
-            "seasonal differencing should have fewer FPs than median subtraction: \
-             diff={diff_fps}, median={median_fps}"
-        );
-    }
-
-    #[test]
-    #[should_panic(expected = "dual detector should have fewer FPs")]
-    fn research_dual_detector_beats_single() {
-        use crate::BocpdDetector;
-
-        let period = 60;
-        // Periodic signal with noise (no real change point -- should have 0 detections)
-        let mut rng = crate::eval::Rng::new(9999);
-        let data: Vec<f64> = (0..360)
-            .map(|i| {
-                let seasonal = (i as f64 * 2.0 * PI / period as f64).sin() * 3.0;
-                seasonal + 5.0 + rng.normal(0.0, 0.3)
-            })
-            .collect();
-
-        let detector = BocpdDetector::new(200.0, 400);
-
-        // Single detector on raw: may fire on seasonal transitions
-        let raw_cps = detector.detect(&data, 0.3);
-
-        // Single detector on detrended: may fire on detrending artifacts
-        let detrender = Detrender::fit(&data, period);
-        let residuals = detrender.detrend(&data, 0);
-        let detrended_cps = detector.detect(&residuals, 0.3);
-
-        // Dual detector: intersect raw and detrended detections
-        let diff_data: Vec<f64> = data
-            .iter()
-            .enumerate()
-            .skip(period)
-            .map(|(i, &y)| y - data[i - period])
-            .collect();
-        let diff_cps = detector.detect(&diff_data, 0.3);
-        let dual_fps: usize = raw_cps
-            .iter()
-            .filter(|cp| {
-                diff_cps.iter().any(|dcp| {
-                    let adj = dcp.index + period;
-                    (adj as i64 - cp.index as i64).unsigned_abs() as usize <= period / 2
-                })
-            })
-            .count();
-
-        let single_fps = raw_cps.len();
-
-        eprintln!(
-            "periodic+noise: raw_fps={}, detrended_fps={}, dual_fps={}",
-            single_fps,
-            detrended_cps.len(),
-            dual_fps
-        );
-        assert!(
-            dual_fps < single_fps,
-            "dual detector should have fewer FPs than raw-only: dual={dual_fps}, single={single_fps}"
-        );
-    }
-
-    #[test]
-    #[should_panic(expected = "trend should not absorb")]
-    fn research_trend_absorbs_step_change() {
-
-        let data: Vec<f64> = (0..200).map(|i| if i < 100 { 0.0 } else { 5.0 }).collect();
-
-        let det = Detrender::fit(&data, 50);
-
-        // The trend coefficient should be near 0 (it's a step, not a slope)
-        // But least-squares fits a line through the step, getting ~0.025 slope
-        eprintln!("step change: trend={:.4}", det.trend);
-        assert!(
-            det.trend.abs() < 0.005,
-            "trend should not absorb the step change, but trend={:.4}",
-            det.trend
-        );
-    }
-
-    // ── End research validation tests ────────────────────────
 
     #[test]
     fn detrend_preserves_real_shift() {
@@ -662,13 +587,78 @@ mod tests {
         let residuals = detrender.detrend(&data, 0);
 
         let detector = BocpdDetector::new(200.0, 350);
-        let cps = detector.detect(&residuals, 0.3);
+        let cps = detector.detect(&residuals);
 
         assert!(!cps.is_empty(), "detrending should preserve the real shift");
         assert!(
             (cps[0].index as i64 - 150).abs() < 20,
             "shift should be detected near 150, got {}",
             cps[0].index
+        );
+    }
+
+    #[test]
+    fn acf_finds_period_within_lag_resolution() {
+        for true_period in [12_usize, 24, 60, 100] {
+            let n = 8 * true_period;
+            let data: Vec<f64> = (0..n)
+                .map(|i| (i as f64 * 2.0 * PI / true_period as f64).sin())
+                .collect();
+            let detected = dominant_period_via_acf(&data).expect("should detect period");
+            let err = (detected as i64 - true_period as i64).abs();
+            assert!(
+                err <= 2,
+                "period {true_period}: detected {detected}, |err|={err}"
+            );
+        }
+    }
+
+    #[test]
+    fn acf_returns_none_for_white_noise() {
+        let mut rng = crate::eval::Rng::new(0xACF_F00D);
+        let data: Vec<f64> = (0..1000).map(|_| rng.normal(0.0, 1.0)).collect();
+        let p = dominant_period_via_acf(&data);
+        assert!(p.is_none(), "white noise should not yield a period: {p:?}");
+    }
+
+    #[test]
+    fn auto_fit_matches_manual_fit() {
+        let period = 60;
+        let data: Vec<f64> = (0..600)
+            .map(|i| (i as f64 * 2.0 * PI / period as f64).sin() * 3.0)
+            .collect();
+        let auto = Detrender::auto_fit(&data).expect("should auto-detect");
+        let manual = Detrender::fit(&data, auto.period());
+        let auto_res = auto.detrend(&data, 0);
+        let manual_res = manual.detrend(&data, 0);
+        for (a, m) in auto_res.iter().zip(&manual_res) {
+            assert!((a - m).abs() < 1e-12, "auto vs manual diverged: {a} vs {m}");
+        }
+    }
+
+    #[test]
+    fn seasonal_guard_with_none_auto_detects() {
+        use crate::BocpdDetector;
+        let period = 60;
+        let data: Vec<f64> = (0..600)
+            .map(|i| {
+                let s = (i as f64 * 2.0 * PI / period as f64).sin() * 3.0;
+                let level = if i < 300 { 0.0 } else { 5.0 };
+                s + level
+            })
+            .collect();
+        let detector = BocpdDetector::new(200.0, 650);
+
+        let with_explicit = super::detect_with_seasonal_guard(&data, Some(period), &detector);
+        let with_auto = super::detect_with_seasonal_guard(&data, None, &detector);
+
+        assert!(!with_auto.is_empty(), "auto-detect path should still detect the shift");
+        let close = with_auto.iter().any(|cp| (cp.index as i64 - 300).abs() <= period as i64);
+        assert!(close, "auto-detect should keep the real CP at ~300");
+        assert_eq!(
+            with_explicit.len(),
+            with_auto.len(),
+            "explicit and auto paths should agree on this clean periodic signal"
         );
     }
 }

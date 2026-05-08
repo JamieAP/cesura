@@ -11,6 +11,9 @@
 use cesura::eval::Rng;
 use cesura::streaming::{DetectorState, StreamingDetector};
 
+#[cfg(feature = "joint-detection")]
+use cesura::streaming_chen_wu::{ChenWuDetectorState, StreamingChenWuDetector};
+
 #[test]
 fn state_size_is_bounded_after_long_run() {
     // Run 10K observations through a streaming detector, serialize, check size.
@@ -19,7 +22,7 @@ fn state_size_is_bounded_after_long_run() {
     let mut det = StreamingDetector::new(200.0, 400);
     let mut rng = Rng::new(123);
     let chunk: Vec<f64> = (0..10_000).map(|_| rng.normal(0.0, 1.0)).collect();
-    det.step(&chunk, 0.5);
+    det.step(&chunk);
 
     let json = serde_json::to_string(&det.save_state()).unwrap();
     let bytes = json.len();
@@ -50,7 +53,7 @@ fn state_json_round_trip_preserves_behavior() {
     let mut det = StreamingDetector::new(200.0, 250);
     let mut rng = Rng::new(7);
     let warmup: Vec<f64> = (0..100).map(|_| rng.normal(0.0, 1.0)).collect();
-    det.step(&warmup, 0.3);
+    det.step(&warmup);
 
     let json = serde_json::to_string(&det.save_state()).unwrap();
     let restored: DetectorState = serde_json::from_str(&json).unwrap();
@@ -59,8 +62,8 @@ fn state_json_round_trip_preserves_behavior() {
     // Same total_steps, same NIG state, same Welford counters -- verify by
     // running identical input through both and comparing detections.
     let post: Vec<f64> = (0..150).map(|_| rng.normal(5.0, 1.0)).collect();
-    let cps_a = det.step(&post, 0.3);
-    let cps_b = det_b.step(&post, 0.3);
+    let cps_a = det.step(&post);
+    let cps_b = det_b.step(&post);
     assert_eq!(
         cps_a.len(),
         cps_b.len(),
@@ -114,5 +117,142 @@ fn state_json_forward_compat_minimal_v1() {
 
     // And it must keep working: feed it data, expect no panic.
     let mut det = det;
-    let _ = det.step(&[0.0; 50], 0.5);
+    let _ = det.step(&[0.0; 50]);
+}
+
+#[test]
+fn v05_state_with_beta_round_trip() {
+    // Save with β = 0.15, restore, then continue. Subsequent step() output
+    // must match a fresh detector also configured with β = 0.15 on identical
+    // input. Without β persistence the restored detector silently drops to the
+    // standard path -- the regression Piece 1 closes.
+    let beta = 0.15;
+    let mut a = StreamingDetector::new(200.0, 250).with_beta(beta);
+    let mut rng = Rng::new(42);
+    let warmup: Vec<f64> = (0..120).map(|_| rng.normal(0.0, 1.0)).collect();
+    a.step(&warmup);
+
+    let json = serde_json::to_string(&a.save_state()).unwrap();
+    let restored: DetectorState = serde_json::from_str(&json).unwrap();
+    assert_eq!(restored.beta, beta, "β missing from serialised state");
+    let mut a_restored = StreamingDetector::restore(restored).unwrap();
+
+    // Fresh detector on the same warmup, also β = 0.15.
+    let mut b = StreamingDetector::new(200.0, 250).with_beta(beta);
+    b.step(&warmup);
+
+    // Now feed both an identical post-warmup stream with a real shift.
+    let mut rng2 = Rng::new(99);
+    let post: Vec<f64> = (0..200)
+        .map(|i| if i < 100 { rng2.normal(0.0, 1.0) } else { rng2.normal(4.0, 1.0) })
+        .collect();
+    let cps_a = a_restored.step(&post);
+    let cps_b = b.step(&post);
+    assert_eq!(
+        cps_a.len(),
+        cps_b.len(),
+        "restored β-detector diverged in CP count: {cps_a:?} vs {cps_b:?}"
+    );
+    for (x, y) in cps_a.iter().zip(cps_b.iter()) {
+        assert_eq!(x.index, y.index, "CP index drift after β restore");
+        assert!((x.confidence - y.confidence).abs() < 1e-9);
+    }
+}
+
+#[cfg(feature = "joint-detection")]
+#[test]
+fn chen_wu_state_round_trip() {
+    // Save with hyperparameters + warmup, restore, run further input,
+    // assert match against a fresh detector with the same hyperparameters.
+    let mut a = StreamingChenWuDetector::new(0.1, 0.2, 4, 0.5, 0.5)
+        .with_search_windows(128, 16)
+        .with_localisation_tolerance(0)
+        .with_min_post_change(5)
+        .with_prior(0.0, 0.01, 0.5, 0.125);
+    let mut rng = Rng::new(42);
+    let warmup: Vec<f64> = (0..120).map(|_| rng.normal(0.0, 1.0)).collect();
+    a.step(&warmup);
+
+    let json = serde_json::to_string(&a.save_state()).unwrap();
+    let restored: ChenWuDetectorState = serde_json::from_str(&json).unwrap();
+    assert_eq!(restored.u_c, 128, "search window survived round-trip");
+    assert_eq!(restored.delta_t, 4);
+    let mut a_restored = StreamingChenWuDetector::restore(restored).unwrap();
+    assert_eq!(a_restored.total_steps(), 120);
+
+    let mut b = StreamingChenWuDetector::new(0.1, 0.2, 4, 0.5, 0.5)
+        .with_search_windows(128, 16)
+        .with_localisation_tolerance(0)
+        .with_min_post_change(5)
+        .with_prior(0.0, 0.01, 0.5, 0.125);
+    b.step(&warmup);
+
+    let mut rng2 = Rng::new(99);
+    let post: Vec<f64> = (0..200)
+        .map(|i| if i < 100 { rng2.normal(0.0, 1.0) } else { rng2.normal(4.0, 1.0) })
+        .collect();
+    let dets_a = a_restored.step(&post);
+    let dets_b = b.step(&post);
+    use cesura::chen_wu::Detection;
+    assert_eq!(
+        dets_a.len(),
+        dets_b.len(),
+        "restored streaming chen_wu diverged in detection count: {dets_a:?} vs {dets_b:?}"
+    );
+    for (a, b) in dets_a.iter().zip(dets_b.iter()) {
+        match (a, b) {
+            (Detection::ChangePoint(x), Detection::ChangePoint(y)) => {
+                assert_eq!(x.index, y.index, "CP index drift after restore");
+                assert!(
+                    (x.confidence - y.confidence).abs() < 1e-9,
+                    "CP confidence drift after restore: {} vs {}",
+                    x.confidence,
+                    y.confidence
+                );
+                assert!(
+                    (x.shift_sigma - y.shift_sigma).abs() < 1e-9,
+                    "CP shift_sigma drift after restore: {} vs {}",
+                    x.shift_sigma,
+                    y.shift_sigma
+                );
+            }
+            (
+                Detection::CollectiveAnomaly { start: s1, end: e1, confidence: c1 },
+                Detection::CollectiveAnomaly { start: s2, end: e2, confidence: c2 },
+            ) => {
+                assert_eq!((s1, e1), (s2, e2), "anomaly window drift after restore");
+                assert!(
+                    (c1 - c2).abs() < 1e-9,
+                    "anomaly confidence drift after restore: {c1} vs {c2}"
+                );
+            }
+            _ => panic!("variant mismatch after restore: {a:?} vs {b:?}"),
+        }
+    }
+}
+
+#[cfg(feature = "joint-detection")]
+#[test]
+fn chen_wu_state_size_is_bounded() {
+    // After 10K obs the serialised state should be < 5 MB (raw_history
+    // + h_c_history + log_h vectors all bounded).
+    let mut det = StreamingChenWuDetector::new(0.1, 0.2, 4, 0.5, 0.5);
+    let mut rng = Rng::new(123);
+    let chunk: Vec<f64> = (0..10_000).map(|_| rng.normal(0.0, 1.0)).collect();
+    det.step(&chunk);
+
+    let json = serde_json::to_string(&det.save_state()).unwrap();
+    let bytes = json.len();
+    eprintln!(
+        "chen_wu state size after 10K obs: {} bytes ({:.1} KB)",
+        bytes,
+        bytes as f64 / 1024.0
+    );
+    assert!(
+        bytes < 5_000_000,
+        "chen_wu state {} bytes after 10K obs -- exceeds 5 MB budget",
+        bytes
+    );
+    // Sanity floor: not implausibly small.
+    assert!(bytes > 1_000, "state too small ({}b) -- looks broken", bytes);
 }

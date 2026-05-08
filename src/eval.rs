@@ -47,6 +47,28 @@ impl Rng {
         let z = (-2.0 * u1.ln()).sqrt() * (2.0 * PI * u2).cos();
         mean + std * z
     }
+
+    /// Cauchy(loc, scale) via inverse-CDF.
+    /// Heavy-tailed: undefined mean and variance. Used to stress-test
+    /// detectors that assume Gaussian-like tails.
+    pub fn cauchy(&mut self, loc: f64, scale: f64) -> f64 {
+        let u = self.uniform().clamp(1e-12, 1.0 - 1e-12);
+        loc + scale * (PI * (u - 0.5)).tan()
+    }
+
+    /// Student-t(df=3) via a standard normal divided by sqrt(chi²(3)/3).
+    /// Its variance is 3; its fourth moment is undefined (infinite kurtosis).
+    /// The tails are markedly heavier than Gaussian.
+    pub fn student_t3(&mut self) -> f64 {
+        // t_3 = Z / sqrt(Y/3) where Z ~ N(0,1) and Y ~ chi²(3).
+        // chi²(3) = sum of 3 squared standard normals.
+        let z = self.normal(0.0, 1.0);
+        let n1 = self.normal(0.0, 1.0);
+        let n2 = self.normal(0.0, 1.0);
+        let n3 = self.normal(0.0, 1.0);
+        let y = n1 * n1 + n2 * n2 + n3 * n3;
+        z / (y / 3.0).sqrt().max(1e-12)
+    }
 }
 
 // ── Scenario types ───────────────────────────────────────────
@@ -209,7 +231,8 @@ pub fn aggregate(metrics: &[EvalMetrics]) -> EvalMetrics {
 }
 
 /// Print a report table.
-pub fn print_report(metrics: &[EvalMetrics]) {
+#[cfg(test)]
+pub(crate) fn print_report(metrics: &[EvalMetrics]) {
     eprintln!(
         "{:<30} {:>5} {:>4} {:>4} {:>4} {:>6} {:>6} {:>6} {:>6}",
         "Scenario", "Cat", "TP", "FP", "FN", "Prec", "Rec", "F1", "Delay"
@@ -273,12 +296,37 @@ pub fn all_scenarios() -> Vec<Scenario> {
         memory_leak(),
         restart_storm(),
         deployment_rollout(),
+        // Heavy-tail (4) -- stress tests for the Gaussian-tail assumption
+        cauchy_noise(),
+        t3_noise(),
+        garch_volatility_clusters(),
+        t3_with_real_shift(),
     ]
+}
+
+/// Subset selector: heavy-tail scenarios only. Used by tests that gauge
+/// improvements (e.g. β-divergence) on the data class where standard
+/// NIG-Gaussian under-models the tails.
+pub fn heavy_tail_scenarios() -> Vec<Scenario> {
+    vec![
+        cauchy_noise(),
+        t3_noise(),
+        garch_volatility_clusters(),
+        t3_with_real_shift(),
+    ]
+}
+
+/// FOCuS GLR baseline detector for comparison.
+/// Returns CP indices from `FocusDetector::detect` at the given threshold.
+pub fn focus_detect(data: &[f64], threshold: f64) -> Vec<usize> {
+    let mut det = crate::focus::FocusDetector::new(threshold);
+    det.detect(data).into_iter().map(|c| c.index).collect()
 }
 
 /// Naive z-score baseline detector for comparison.
 /// Returns indices where |z| > threshold using a rolling window.
-pub fn naive_zscore_detect(data: &[f64], window: usize, z_thresh: f64) -> Vec<usize> {
+#[cfg(test)]
+pub(crate) fn naive_zscore_detect(data: &[f64], window: usize, z_thresh: f64) -> Vec<usize> {
     let mut detections = Vec::new();
     let cooldown = 15;
     let mut last_det = 0usize;
@@ -644,6 +692,89 @@ fn restart_storm() -> Scenario {
         data,
         period: None,
         ground_truth: vec![150, 180],
+    }
+}
+
+// ── Heavy-tail scenarios ─────────────────────────────────────
+//
+// Real-world inputs are rarely Gaussian. Crypto returns, network latencies,
+// and queue depths exhibit kurtosis 5-15. Standard BOCPD with NIG-Gaussian
+// likelihood under-models the tails and fires on legitimate tail events as
+// if they were change points. These scenarios pin that behaviour.
+
+fn cauchy_noise() -> Scenario {
+    // Cauchy(0, 1): undefined mean and variance. Standard cesura fires
+    // on every tail event; β-divergence should suppress them.
+    let mut rng = Rng::new(5001);
+    let data: Vec<f64> = (0..300).map(|_| rng.cauchy(0.0, 1.0)).collect();
+    Scenario {
+        name: "cauchy_noise",
+        category: Category::MustReject,
+        data,
+        period: None,
+        ground_truth: vec![],
+    }
+}
+
+fn t3_noise() -> Scenario {
+    // Student-t with df=3: heavy tails but finite variance. Milder
+    // than Cauchy; a sanity check that β-divergence's robustness
+    // does not require pathological inputs to show.
+    let mut rng = Rng::new(5002);
+    let data: Vec<f64> = (0..300).map(|_| rng.student_t3()).collect();
+    Scenario {
+        name: "t3_noise",
+        category: Category::MustReject,
+        data,
+        period: None,
+        ground_truth: vec![],
+    }
+}
+
+fn garch_volatility_clusters() -> Scenario {
+    // GARCH(1,1): σ²_t = ω + α·ε²_{t-1} + β·σ²_{t-1}. Volatility clusters
+    // but the unconditional mean is zero -- no regime change. A naive
+    // detector confuses high-vol periods for shifts.
+    // Parameters chosen so the process is stationary (α + β < 1) but
+    // exhibits visible clustering: ω=0.05, α=0.20, β=0.75.
+    let mut rng = Rng::new(5003);
+    let omega = 0.05_f64;
+    let alpha = 0.20_f64;
+    let beta = 0.75_f64;
+    let mut sigma_sq = omega / (1.0 - alpha - beta); // unconditional var
+    let mut prev_eps = 0.0_f64;
+    let data: Vec<f64> = (0..300)
+        .map(|_| {
+            sigma_sq = omega + alpha * prev_eps * prev_eps + beta * sigma_sq;
+            let eps = rng.normal(0.0, sigma_sq.sqrt());
+            prev_eps = eps;
+            eps
+        })
+        .collect();
+    Scenario {
+        name: "garch_clusters",
+        category: Category::MustReject,
+        data,
+        period: None,
+        ground_truth: vec![],
+    }
+}
+
+fn t3_with_real_shift() -> Scenario {
+    // t₃ noise (scale 1) with a 3σ-of-noise mean shift at t=150. The
+    // detector must still resolve the shift even with heavy-tailed
+    // observations dominating the predictive likelihood. t₃ has
+    // variance 3, so std ≈ 1.732; a "3σ" shift in noise units is 3*1.732 ≈ 5.2.
+    let mut rng = Rng::new(5004);
+    let mut data: Vec<f64> = (0..150).map(|_| rng.student_t3()).collect();
+    let shift = 3.0 * 3.0_f64.sqrt();
+    data.extend((0..150).map(|_| shift + rng.student_t3()));
+    Scenario {
+        name: "t3_with_shift",
+        category: Category::MustDetect,
+        data,
+        period: None,
+        ground_truth: vec![150],
     }
 }
 

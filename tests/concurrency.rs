@@ -44,7 +44,7 @@ fn parallel_batch_detect_is_deterministic() {
             let data = Arc::clone(&data);
             let det = Arc::clone(&det);
             thread::spawn(move || {
-                det.detect(&data, 0.3)
+                det.detect(&data)
                     .into_iter()
                     .map(|cp| (cp.index, cp.confidence.to_bits()))
                     .collect::<Vec<_>>()
@@ -81,7 +81,7 @@ fn parallel_streaming_detectors_are_isolated() {
         .iter()
         .map(|s| {
             let mut det = StreamingDetector::new(200.0, 350);
-            det.step(s, 0.3)
+            det.step(s)
                 .into_iter()
                 .map(|cp| (cp.index, cp.confidence.to_bits()))
                 .collect()
@@ -95,7 +95,7 @@ fn parallel_streaming_detectors_are_isolated() {
             let signals = Arc::clone(&signals);
             thread::spawn(move || {
                 let mut det = StreamingDetector::new(200.0, 350);
-                det.step(&signals[i], 0.3)
+                det.step(&signals[i])
                     .into_iter()
                     .map(|cp| (cp.index, cp.confidence.to_bits()))
                     .collect::<Vec<_>>()

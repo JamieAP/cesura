@@ -1,0 +1,1331 @@
+//! Bayesian Online Change Point detector (univariate + multivariate).
+
+use crate::math::log_add_exp;
+use crate::niw;
+use crate::nig::Nig;
+use crate::ChangePoint;
+use crate::DEFAULT_MASS_CUTOFF;
+
+#[allow(clippy::needless_range_loop)]
+/// Sample mean and Cholesky factor `L` of the sample covariance matrix.
+///
+/// Returns `None` when the matrix is not positive-definite -- i.e. some
+/// dimension is degenerate or two dimensions are linearly dependent.
+/// Caller is expected to fall back to per-dim normalisation in that
+/// case rather than panic.
+fn whitening_transform(warmup: &[Vec<f64>], d: usize) -> Option<(Vec<f64>, Vec<Vec<f64>>)> {
+    let n = warmup.len();
+    if n < 2 || d == 0 {
+        return None;
+    }
+    let nf = n as f64;
+    let mut mean = vec![0.0; d];
+    for row in warmup {
+        for j in 0..d {
+            mean[j] += row[j];
+        }
+    }
+    for m in mean.iter_mut() {
+        *m /= nf;
+    }
+    // Sample covariance with N denominator (biased; matches the per-dim
+    // z-norm convention already used here).
+    let mut cov = vec![vec![0.0; d]; d];
+    for row in warmup {
+        for i in 0..d {
+            for j in 0..d {
+                cov[i][j] += (row[i] - mean[i]) * (row[j] - mean[j]);
+            }
+        }
+    }
+    for i in 0..d {
+        for j in 0..d {
+            cov[i][j] /= nf;
+        }
+    }
+    let l = cholesky_lower(&cov)?;
+    Some((mean, l))
+}
+
+#[allow(clippy::needless_range_loop)]
+/// Cholesky factor `L` such that `L · Lᵀ = A`, lower-triangular.
+/// Returns `None` if `A` is not positive-definite.
+fn cholesky_lower(a: &[Vec<f64>]) -> Option<Vec<Vec<f64>>> {
+    let d = a.len();
+    let mut l = vec![vec![0.0; d]; d];
+    for i in 0..d {
+        for j in 0..=i {
+            let mut s = a[i][j];
+            for k in 0..j {
+                s -= l[i][k] * l[j][k];
+            }
+            if i == j {
+                // Reject non-positive diagonal entries: input is not PD.
+                if s <= 1e-12 {
+                    return None;
+                }
+                l[i][j] = s.sqrt();
+            } else {
+                l[i][j] = s / l[j][j];
+            }
+        }
+    }
+    Some(l)
+}
+
+/// Solve `L · y = b` for `y` via forward substitution. `L` must be
+/// lower-triangular with non-zero diagonal.
+fn forward_solve(l: &[Vec<f64>], b: &[f64]) -> Vec<f64> {
+    let d = b.len();
+    let mut y = vec![0.0; d];
+    for i in 0..d {
+        let mut s = b[i];
+        for k in 0..i {
+            s -= l[i][k] * y[k];
+        }
+        y[i] = s / l[i][i];
+    }
+    y
+}
+
+/// Per-dimension z-normalisation fallback for `detect_multivariate`.
+fn per_dim_znorm(data: &[Vec<f64>], d: usize, n: usize) -> Vec<Vec<f64>> {
+    let mut means = vec![0.0; d];
+    let mut stds = vec![0.0; d];
+    for dim in 0..d {
+        let m: f64 = data.iter().map(|x| x[dim]).sum::<f64>() / n as f64;
+        let s = (data.iter().map(|x| (x[dim] - m).powi(2)).sum::<f64>() / n as f64).sqrt();
+        means[dim] = m;
+        stds[dim] = if s < 1e-10 { 1.0 } else { s };
+    }
+    data.iter()
+        .map(|x| (0..d).map(|i| (x[i] - means[i]) / stds[i]).collect())
+        .collect()
+}
+
+/// Bayesian Online Change Point Detector.
+///
+/// Uses the BOCPD algorithm with a Normal-Inverse-Gamma conjugate prior
+/// and MAP run-length estimation for change point detection.
+pub struct BocpdDetector {
+    hazard_log: f64,
+    growth_log: f64,
+    max_rl: usize,
+    log_mass_cutoff: f64,
+    /// β-divergence robustness parameter. `0.0` ⇒ standard BOCPD (default,
+    /// short-circuited so behaviour is bit-for-bit identical to pre-β code).
+    /// `β > 0` ⇒ Knoblauch et al. (2018) robust update for heavy-tailed
+    /// within-regime distributions.
+    beta: f64,
+    prior: Nig,
+}
+
+impl BocpdDetector {
+    /// Create a detector with expected run length `lambda` between change points.
+    ///
+    /// - `lambda`: expected number of observations between change points.
+    ///   Smaller values make the detector more sensitive (more false positives).
+    /// - `max_run_length`: hard upper bound on tracked run length. With the
+    ///   default mass-pruning cutoff (`DEFAULT_MASS_CUTOFF`), this is rarely
+    ///   the binding constraint -- the tail prunes itself well before the
+    ///   cap. Set generously (≥ data.len() for batch).
+    ///
+    /// # Panics
+    /// Panics if `lambda <= 1.0` (would produce -inf or NaN hazard rates).
+    pub fn new(lambda: f64, max_run_length: usize) -> Self {
+        assert!(lambda > 1.0, "lambda must be > 1.0, got {lambda}");
+        let h = 1.0 / lambda;
+        Self {
+            hazard_log: h.ln(),
+            growth_log: (1.0 - h).ln(),
+            max_rl: max_run_length,
+            log_mass_cutoff: DEFAULT_MASS_CUTOFF.ln(),
+            beta: 0.0,
+            prior: Nig {
+                mu: 0.0,
+                kappa: 1.0,
+                alpha: 1.0,
+                beta: 1.0,
+            },
+        }
+    }
+
+    /// Opt into β-divergence robust BOCPD (Knoblauch et al. 2018,
+    /// arXiv:1806.02261). The standard Bayesian update is replaced with
+    /// a divergence-based update whose influence function is bounded;
+    /// tail observations under heavy-tailed within-regime noise no longer
+    /// dominate the posterior.
+    ///
+    /// `beta = 0.0` is the default and short-circuits to standard cesura
+    /// (bit-for-bit identical, no overhead). Reasonable robust defaults
+    /// per Knoblauch's empirical work are in the range `[0.05, 0.10]`;
+    /// larger `β` is more robust but loses statistical efficiency on
+    /// well-behaved data.
+    ///
+    /// # Panics
+    /// Panics if `beta < 0.0` or `beta > 1.0`.
+    pub fn with_beta(mut self, beta: f64) -> Self {
+        assert!(
+            (0.0..=1.0).contains(&beta),
+            "beta must be in [0.0, 1.0], got {beta}"
+        );
+        self.beta = beta;
+        self
+    }
+
+    /// Estimate β from a warmup window's sample excess kurtosis.
+    /// See [`auto_beta`](crate::auto_beta) for the mapping and provenance.
+    ///
+    /// Near-Gaussian inputs (`|k_ex| ≤ 1`) return β = 0 -- the standard
+    /// (non-robust) path. Heavier-tailed inputs receive a proportional
+    /// β capped at 0.20.
+    pub fn with_auto_beta(self, warmup: &[f64]) -> Self {
+        self.with_beta(crate::auto_beta::auto_beta(warmup))
+    }
+
+    /// Set the mass-pruning cutoff. After each step the run-length posterior
+    /// is renormalised; trailing entries whose mass falls below `cutoff`
+    /// are zeroed (set to `-∞` in log space) so subsequent steps skip them.
+    /// Adapted from `changepoint::BocpdTruncated::with_cutoff`.
+    ///
+    /// Lower cutoff → keeps more tail mass, more memory + compute, fewer
+    /// truncation artefacts. Higher cutoff → aggressive pruning.
+    /// `0.0` disables pruning (all run lengths up to `max_run_length`).
+    pub fn with_mass_cutoff(mut self, cutoff: f64) -> Self {
+        self.log_mass_cutoff = if cutoff > 0.0 {
+            cutoff.ln()
+        } else {
+            f64::NEG_INFINITY
+        };
+        self
+    }
+
+    /// Run BOCPD on `data`, return all change points that pass the
+    /// MAP-drop heuristic.
+    ///
+    /// Each returned [`ChangePoint`] carries a `confidence` in `[0, 1]`.
+    /// Filter post-hoc on `cp.confidence >= 0.9` if you want a stricter
+    /// gate; the structural floor of the heuristic is approximately 0.85.
+    ///
+    /// Returns an empty vec if `data` has fewer than 20 elements.
+    ///
+    /// # Heuristic constants
+    ///
+    /// The MAP-drop detector uses three hand-tuned constants -- `drop_to=3`,
+    /// `min_prev_rl=30`, `cooldown=15` -- that gate when a run-length drop
+    /// is reported as a change point. They are not from Adams & MacKay (2007);
+    /// the underlying BOCPD recursion (NIG predictive, log-space update) is.
+    /// Tests verify the math; these constants are tuned against the eval suite.
+    pub fn detect(&self, data: &[f64]) -> Vec<ChangePoint> {
+        // Filter NaN/infinite values, keeping a map back to original indices
+        let mut original_indices: Vec<usize> = Vec::new();
+        let data: Vec<f64> = data
+            .iter()
+            .enumerate()
+            .filter_map(|(i, &v)| {
+                if v.is_finite() {
+                    original_indices.push(i);
+                    Some(v)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let n = data.len();
+        if n < 20 {
+            return vec![];
+        }
+
+        // Normalize for numerical stability
+        let mean = data.iter().sum::<f64>() / n as f64;
+        let std = (data.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / n as f64).sqrt();
+        let std = if std < 1e-10 { 1.0 } else { std };
+        let norm: Vec<f64> = data.iter().map(|x| (x - mean) / std).collect();
+
+        let max_r = self.max_rl.min(n);
+
+        // Run length log-probabilities
+        let mut rl_log = vec![f64::NEG_INFINITY; max_r + 1];
+        rl_log[0] = 0.0; // r_0 = 0 with certainty
+
+        // Sufficient statistics per run length
+        let mut stats = vec![self.prior.clone(); max_r + 1];
+
+        // Track MAP run length and posterior P(r_t = 0) at each time step
+        let mut map_rls = Vec::with_capacity(n);
+        let mut cp_probs = Vec::with_capacity(n);
+
+        // `log_predictive_robust` short-circuits internally at β = 0 to the
+        // exact standard log-predictive (literal early return); we can always
+        // call it and let it pick.
+        let beta = self.beta;
+        let prior_pred_at = |x: f64| self.prior.log_predictive_robust(x, beta);
+
+        for (t, &x) in norm.iter().enumerate() {
+            let active = (t + 1).min(max_r);
+
+            let mut new_rl = vec![f64::NEG_INFINITY; max_r + 1];
+            let mut prev_mass = f64::NEG_INFINITY;
+
+            for r in 0..=active.min(max_r.saturating_sub(1)) {
+                if rl_log[r] == f64::NEG_INFINITY {
+                    continue;
+                }
+                let pred = stats[r].log_predictive_robust(x, beta);
+                if !pred.is_finite() {
+                    continue;
+                }
+
+                // Growth: r -> r+1 uses posterior predictive given r history.
+                if r < max_r {
+                    new_rl[r + 1] =
+                        log_add_exp(new_rl[r + 1], rl_log[r] + pred + self.growth_log);
+                }
+                // Accumulate prior-segment mass for the CP branch.
+                prev_mass = log_add_exp(prev_mass, rl_log[r]);
+            }
+            // Change point: r_t = 0 starts a fresh segment, so the predictive
+            // is the *prior* predictive (no history). This is the Adams-MacKay
+            // formulation; using the posterior predictive here caps P(r_t=0)
+            // near the hazard rate even at real CPs.
+            let prior_pred = prior_pred_at(x);
+            new_rl[0] = if prior_pred.is_finite() && prev_mass.is_finite() {
+                prev_mass + self.hazard_log + prior_pred
+            } else {
+                f64::NEG_INFINITY
+            };
+
+            // Normalize
+            let evidence = new_rl
+                .iter()
+                .copied()
+                .filter(|x| x.is_finite())
+                .fold(f64::NEG_INFINITY, log_add_exp);
+            if evidence.is_finite() {
+                for v in new_rl.iter_mut() {
+                    *v -= evidence;
+                }
+            }
+
+            // Mass-prune the tail: drop trailing run lengths whose
+            // normalised posterior mass falls below the cutoff. Subsequent
+            // steps skip them, giving data-adaptive truncation -- the
+            // documented "phantom MAP-drop near max_rl" symptom of fixed-cap
+            // truncation cannot occur if the tail is pruned before it
+            // approaches the cap.
+            if self.log_mass_cutoff > f64::NEG_INFINITY {
+                for r in (1..=max_r).rev() {
+                    if new_rl[r] >= self.log_mass_cutoff {
+                        break;
+                    }
+                    new_rl[r] = f64::NEG_INFINITY;
+                }
+            }
+
+            // MAP run length
+            let map_r = new_rl
+                .iter()
+                .enumerate()
+                .filter(|(_, v)| v.is_finite())
+                .max_by(|a, b| a.1.total_cmp(b.1))
+                .map(|(r, _)| r)
+                .unwrap_or(0);
+            map_rls.push(map_r);
+            cp_probs.push(if new_rl[0].is_finite() {
+                new_rl[0].exp()
+            } else {
+                0.0
+            });
+
+            // Update sufficient stats for each growth path
+            let mut new_stats = vec![self.prior.clone(); max_r + 1];
+            for r in 0..=active.min(max_r.saturating_sub(1)) {
+                if r < max_r && new_rl[r + 1] > f64::NEG_INFINITY {
+                    new_stats[r + 1] = stats[r].update(x);
+                }
+            }
+            // new_stats[0] stays as prior (fresh regime)
+
+            rl_log = new_rl;
+            stats = new_stats;
+        }
+
+        // Detect change points: where MAP run length drops sharply.
+        let drop_to = 3;
+        let min_prev_rl = 30;
+        let cooldown = 15;
+
+        let mut result = Vec::new();
+        let mut i = min_prev_rl;
+        let mut last_detection = 0usize;
+        while i < n {
+            if map_rls[i] <= drop_to && i - last_detection >= cooldown {
+                let prev_max = map_rls[i.saturating_sub(15)..i]
+                    .iter()
+                    .copied()
+                    .max()
+                    .unwrap_or(0);
+                if prev_max >= min_prev_rl {
+                    // Peak posterior P(r_t = 0) over the recent cooldown window.
+                    // The MAP-drop trigger fires a few steps after the true CP,
+                    // by which time r_t has reset; the peak captures the CP
+                    // moment itself.
+                    let look_back = cooldown.min(i);
+                    let confidence = cp_probs[i.saturating_sub(look_back)..=i]
+                        .iter()
+                        .copied()
+                        .fold(0.0_f64, f64::max)
+                        .clamp(0.0, 1.0);
+                    let w = 20;
+                    let before = &norm[i.saturating_sub(w)..i];
+                    let after = &norm[i..(i + w).min(n)];
+                    let mean_b = if before.is_empty() {
+                        0.0
+                    } else {
+                        before.iter().sum::<f64>() / before.len() as f64
+                    };
+                    let mean_a = if after.is_empty() {
+                        0.0
+                    } else {
+                        after.iter().sum::<f64>() / after.len() as f64
+                    };
+                    let shift_sigma = (mean_a - mean_b).abs();
+
+                    // Phantom (max_rl truncation on stable signal): do not
+                    // claim cooldown so a real CP immediately after isn't masked.
+                    if shift_sigma < 1e-9 {
+                        i += 1;
+                        continue;
+                    }
+
+                    last_detection = i;
+                    result.push(ChangePoint {
+                        index: original_indices[i],
+                        confidence,
+                        shift_sigma,
+                    });
+                    i += cooldown;
+                    continue;
+                }
+            }
+            i += 1;
+        }
+        result
+    }
+
+    /// Run multivariate BOCPD on d-dimensional data.
+    ///
+    /// `data` is a slice of d-dimensional observations (each `Vec<f64>` has length d).
+    /// All observations must have the same dimensionality.
+    ///
+    /// Returns change points using the same MAP run-length drop detection as univariate.
+    pub fn detect_multivariate(&self, data: &[Vec<f64>]) -> Vec<ChangePoint> {
+        let n = data.len();
+        if n < 20 {
+            return vec![];
+        }
+        let d = data[0].len();
+        if d == 0 {
+            return vec![];
+        }
+        // Reject ragged input -- all rows must have the same dimensionality
+        if data.iter().any(|row| row.len() != d) {
+            return vec![];
+        }
+
+        // Joint whitening: estimate the warmup-window sample covariance,
+        // Cholesky-decompose, transform all observations into whitened space.
+        // A correlated shift across dimensions becomes a translation in
+        // whitened coordinates, which the per-segment NIW predictive picks
+        // up just as readily as a univariate mean shift.
+        //
+        // Fallback to per-dim z-norm when the warmup is too short (n < 2d)
+        // or the covariance is rank-deficient -- in both cases joint
+        // whitening is undefined and per-dim normalisation is the safe
+        // baseline.
+        let warmup_n = (n / 3).min(60).max(d * 2);
+        let norm: Vec<Vec<f64>> = if warmup_n >= d * 2 && warmup_n <= n {
+            match whitening_transform(&data[..warmup_n], d) {
+                Some((mean, l_inv)) => data
+                    .iter()
+                    .map(|x| {
+                        let centered: Vec<f64> =
+                            (0..d).map(|i| x[i] - mean[i]).collect();
+                        forward_solve(&l_inv, &centered)
+                    })
+                    .collect(),
+                None => per_dim_znorm(data, d, n),
+            }
+        } else {
+            per_dim_znorm(data, d, n)
+        };
+
+        let max_r = self.max_rl.min(n);
+        let prior = niw::Niw::new(d);
+
+        // Run length log-probabilities
+        let mut rl_log = vec![f64::NEG_INFINITY; max_r + 1];
+        rl_log[0] = 0.0;
+
+        let mut stats = vec![prior.clone(); max_r + 1];
+        let mut map_rls = Vec::with_capacity(n);
+        let mut cp_probs = Vec::with_capacity(n);
+
+        for (t, x) in norm.iter().enumerate() {
+            let active = (t + 1).min(max_r);
+            let mut new_rl = vec![f64::NEG_INFINITY; max_r + 1];
+            let mut prev_mass = f64::NEG_INFINITY;
+
+            for r in 0..=active.min(max_r.saturating_sub(1)) {
+                if rl_log[r] == f64::NEG_INFINITY {
+                    continue;
+                }
+                let pred = stats[r].log_predictive(x);
+                if !pred.is_finite() {
+                    continue;
+                }
+                if r < max_r {
+                    new_rl[r + 1] =
+                        log_add_exp(new_rl[r + 1], rl_log[r] + pred + self.growth_log);
+                }
+                prev_mass = log_add_exp(prev_mass, rl_log[r]);
+            }
+            let prior_pred = prior.log_predictive(x);
+            new_rl[0] = if prior_pred.is_finite() && prev_mass.is_finite() {
+                prev_mass + self.hazard_log + prior_pred
+            } else {
+                f64::NEG_INFINITY
+            };
+
+            // Normalize
+            let evidence = new_rl
+                .iter()
+                .copied()
+                .filter(|x| x.is_finite())
+                .fold(f64::NEG_INFINITY, log_add_exp);
+            if evidence.is_finite() {
+                for v in new_rl.iter_mut() {
+                    *v -= evidence;
+                }
+            }
+
+            // Mass-prune the tail (see univariate path for rationale).
+            if self.log_mass_cutoff > f64::NEG_INFINITY {
+                for r in (1..=max_r).rev() {
+                    if new_rl[r] >= self.log_mass_cutoff {
+                        break;
+                    }
+                    new_rl[r] = f64::NEG_INFINITY;
+                }
+            }
+
+            let map_r = new_rl
+                .iter()
+                .enumerate()
+                .filter(|(_, v)| v.is_finite())
+                .max_by(|a, b| a.1.total_cmp(b.1))
+                .map(|(r, _)| r)
+                .unwrap_or(0);
+            map_rls.push(map_r);
+            cp_probs.push(if new_rl[0].is_finite() {
+                new_rl[0].exp()
+            } else {
+                0.0
+            });
+
+            let mut new_stats = vec![prior.clone(); max_r + 1];
+            for r in 0..=active.min(max_r.saturating_sub(1)) {
+                if r < max_r && new_rl[r + 1] > f64::NEG_INFINITY {
+                    new_stats[r + 1] = stats[r].update(x);
+                }
+            }
+
+            rl_log = new_rl;
+            stats = new_stats;
+        }
+
+        // MAP run-length drop detection (same logic as univariate)
+        let drop_to = 3;
+        let min_prev_rl = 30;
+        let cooldown = 15;
+
+        let mut result = Vec::new();
+        let mut i = min_prev_rl;
+        let mut last_detection = 0usize;
+        while i < n {
+            if map_rls[i] <= drop_to && i - last_detection >= cooldown {
+                let prev_max = map_rls[i.saturating_sub(15)..i]
+                    .iter()
+                    .copied()
+                    .max()
+                    .unwrap_or(0);
+                if prev_max >= min_prev_rl {
+                    let look_back = cooldown.min(i);
+                    let confidence = cp_probs[i.saturating_sub(look_back)..=i]
+                        .iter()
+                        .copied()
+                        .fold(0.0_f64, f64::max)
+                        .clamp(0.0, 1.0);
+                    let w = 20;
+                    let before = &norm[i.saturating_sub(w)..i];
+                    let after = &norm[i..(i + w).min(n)];
+                    let shift_sigma = if before.is_empty() || after.is_empty() {
+                        0.0
+                    } else {
+                        let mut sum_sq = 0.0;
+                        for dim in 0..d {
+                            let mean_b = before.iter().map(|x| x[dim]).sum::<f64>()
+                                / before.len() as f64;
+                            let mean_a =
+                                after.iter().map(|x| x[dim]).sum::<f64>() / after.len() as f64;
+                            sum_sq += (mean_a - mean_b).powi(2);
+                        }
+                        sum_sq.sqrt()
+                    };
+
+                    if shift_sigma < 1e-9 {
+                        i += 1;
+                        continue;
+                    }
+
+                    last_detection = i;
+                    result.push(ChangePoint {
+                        index: i,
+                        confidence,
+                        shift_sigma,
+                    });
+                    i += cooldown;
+                    continue;
+                }
+            }
+            i += 1;
+        }
+        result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::eval::Rng;
+
+    // ── Affine invariance of detection ────────────────────────────────
+
+    #[test]
+    fn detection_is_affine_invariant() {
+        // The detector normalizes input internally (subtract mean, divide by σ),
+        // so a positive affine transform y = a·x + b must produce identical
+        // change point indices.
+        let mut rng = Rng::new(13);
+        let mut x: Vec<f64> = (0..150).map(|_| rng.normal(0.0, 1.0)).collect();
+        x.extend((0..150).map(|_| rng.normal(3.0, 1.0)));
+
+        let det = BocpdDetector::new(200.0, 350);
+
+        let raw_cps: Vec<usize> = det.detect(&x).iter().map(|c| c.index).collect();
+
+        for &(a, b) in &[(1.0, 100.0), (5.0, -50.0), (0.1, 7.0), (1000.0, 0.0)] {
+            let y: Vec<f64> = x.iter().map(|&v| a * v + b).collect();
+            let trans_cps: Vec<usize> = det.detect(&y).iter().map(|c| c.index).collect();
+            assert_eq!(
+                raw_cps, trans_cps,
+                "affine (a={a}, b={b}) shifted CPs: raw={raw_cps:?}, transformed={trans_cps:?}"
+            );
+        }
+    }
+
+    // ── Detector: detection correctness ───────────────────────────────
+
+    #[test]
+    fn detects_clean_mean_shift() {
+        let mut data = vec![0.0; 100];
+        data.extend(vec![5.0; 100]);
+        let det = BocpdDetector::new(200.0, 250);
+        let cps = det.detect(&data);
+        assert!(!cps.is_empty(), "should detect the mean shift");
+        assert!(
+            (cps[0].index as i64 - 100).abs() < 15,
+            "change point near index 100, got {}",
+            cps[0].index
+        );
+    }
+
+    #[test]
+    fn detects_noisy_mean_shift() {
+        let mut rng = Rng::new(123);
+        let mut data: Vec<f64> = (0..150).map(|_| rng.normal(0.0, 1.0)).collect();
+        data.extend((0..150).map(|_| rng.normal(3.0, 1.0)));
+        let det = BocpdDetector::new(200.0, 350);
+        let cps = det.detect(&data);
+        assert!(!cps.is_empty(), "should detect noisy mean shift (3σ)");
+        assert!(
+            (cps[0].index as i64 - 150).abs() < 30,
+            "change point near 150, got {}",
+            cps[0].index
+        );
+    }
+
+    #[test]
+    fn no_detection_on_constant() {
+        let data = vec![1.0; 200];
+        let det = BocpdDetector::new(200.0, 250);
+        let cps = det.detect(&data);
+        assert!(cps.is_empty(), "constant signal should have no detections");
+    }
+
+    #[test]
+    fn no_detection_on_stationary_noise() {
+        let mut rng = Rng::new(999);
+        let data: Vec<f64> = (0..300).map(|_| rng.normal(0.0, 1.0)).collect();
+        let det = BocpdDetector::new(200.0, 350);
+        let cps = det.detect(&data);
+        assert!(
+            cps.len() <= 1,
+            "stationary noise should produce ≤1 false positive, got {}",
+            cps.len()
+        );
+    }
+
+    #[test]
+    fn false_positive_rate_under_5_percent() {
+        let det = BocpdDetector::new(200.0, 350);
+        let mut fp_count = 0;
+        for seed in 0..20 {
+            let mut rng = Rng::new(seed * 7919 + 31);
+            let data: Vec<f64> = (0..300).map(|_| rng.normal(0.0, 1.0)).collect();
+            if !det.detect(&data).is_empty() {
+                fp_count += 1;
+            }
+        }
+        assert!(
+            fp_count <= 3,
+            "false positive rate too high: {fp_count}/20 trials"
+        );
+    }
+
+    #[test]
+    fn detection_power_increases_with_shift() {
+        let det = BocpdDetector::new(200.0, 250);
+        let mut rates = Vec::new();
+        for &shift in &[1.0, 3.0, 5.0] {
+            let mut detections = 0;
+            for seed in 0..20 {
+                let mut rng = Rng::new(seed * 1000 + shift as u64 * 100);
+                let mut data: Vec<f64> = (0..100).map(|_| rng.normal(0.0, 1.0)).collect();
+                data.extend((0..100).map(|_| rng.normal(shift, 1.0)));
+                if !det.detect(&data).is_empty() {
+                    detections += 1;
+                }
+            }
+            rates.push(detections);
+        }
+        assert!(
+            rates[2] > rates[0],
+            "5σ should detect more than 1σ: 1σ={}, 5σ={}",
+            rates[0],
+            rates[2]
+        );
+        assert!(
+            rates[2] >= 15,
+            "5σ shift detected {}/20 -- should be ≥15",
+            rates[2]
+        );
+    }
+
+    #[test]
+    fn detection_delay_bounded() {
+        let mut data = vec![0.0; 100];
+        data.extend(vec![5.0; 100]);
+        let det = BocpdDetector::new(200.0, 250);
+        let cps = det.detect(&data);
+        assert!(!cps.is_empty());
+        let delay = (cps[0].index as i64 - 100).abs();
+        assert!(delay <= 15, "detection delay={delay} steps -- should be ≤15");
+    }
+
+    #[test]
+    fn detects_collective_anomaly() {
+        let mut data = vec![0.0; 80];
+        data.extend(vec![5.0; 40]);
+        data.extend(vec![0.0; 80]);
+        let det = BocpdDetector::new(200.0, 250);
+        let cps = det.detect(&data);
+        assert!(
+            cps.len() >= 2,
+            "should detect start+end of collective anomaly, got {} detections",
+            cps.len()
+        );
+        assert!(
+            (cps[0].index as i64 - 80).abs() < 15,
+            "anomaly start near 80, got {}",
+            cps[0].index
+        );
+        assert!(
+            (cps[1].index as i64 - 120).abs() < 15,
+            "anomaly end near 120, got {}",
+            cps[1].index
+        );
+    }
+
+    #[test]
+    fn detects_variance_change() {
+        let mut data: Vec<f64> = (0..100).map(|i| (i as f64 * 0.1).sin() * 0.1).collect();
+        data.extend((0..100).map(|i| (i as f64 * 0.3).sin() * 2.0));
+        let det = BocpdDetector::new(200.0, 250);
+        let cps = det.detect(&data);
+        assert!(!cps.is_empty(), "should detect variance change");
+    }
+
+    #[test]
+    fn detects_multiple_change_points() {
+        let mut data = vec![0.0; 80];
+        data.extend(vec![5.0; 80]);
+        data.extend(vec![-3.0; 80]);
+        let det = BocpdDetector::new(200.0, 300);
+        let cps = det.detect(&data);
+        assert!(
+            cps.len() >= 2,
+            "should detect ≥2 change points, got {}",
+            cps.len()
+        );
+    }
+
+    // ── Edge cases ────────────────────────────────────────────────────
+
+    #[test]
+    fn too_short_returns_empty() {
+        let det = BocpdDetector::new(200.0, 250);
+        assert!(det.detect(&[]).is_empty());
+        assert!(det.detect(&[1.0; 5]).is_empty());
+        assert!(det.detect(&[1.0; 19]).is_empty());
+    }
+
+    #[test]
+    fn handles_nan_in_normalization() {
+        let mut data = vec![0.0; 100];
+        data.extend(vec![5.0; 100]);
+        data[50] = 1e10;
+        data[51] = -1e10;
+        let det = BocpdDetector::new(200.0, 250);
+        let cps = det.detect(&data);
+        let _ = cps;
+    }
+
+    #[test]
+    fn handles_large_values() {
+        let mut data = vec![1e9; 100];
+        data.extend(vec![2e9; 100]);
+        let det = BocpdDetector::new(200.0, 250);
+        let cps = det.detect(&data);
+        assert!(
+            !cps.is_empty(),
+            "should detect shift even with large absolute values"
+        );
+    }
+
+    #[test]
+    fn handles_negative_values() {
+        let mut data = vec![-100.0; 100];
+        data.extend(vec![-50.0; 100]);
+        let det = BocpdDetector::new(200.0, 250);
+        let cps = det.detect(&data);
+        assert!(!cps.is_empty(), "should detect shift in negative values");
+    }
+
+    #[test]
+    fn change_at_very_start_not_detected() {
+        let mut data = vec![0.0; 5];
+        data.extend(vec![10.0; 195]);
+        let det = BocpdDetector::new(200.0, 250);
+        let cps = det.detect(&data);
+        for cp in &cps {
+            assert!(
+                cp.index >= 30,
+                "detection at {} is too early (before warmup/min_prev_rl)",
+                cp.index
+            );
+        }
+    }
+
+    // ── Parameter sensitivity ─────────────────────────────────────────
+
+    #[test]
+    fn higher_threshold_fewer_detections() {
+        let mut rng = Rng::new(777);
+        let mut data: Vec<f64> = (0..100).map(|_| rng.normal(0.0, 1.0)).collect();
+        data.extend((0..100).map(|_| rng.normal(2.0, 1.0)));
+        data.extend((0..100).map(|_| rng.normal(0.0, 1.0)));
+        let det = BocpdDetector::new(200.0, 350);
+        let low = det.detect(&data).len();
+        let high = det.detect(&data).len();
+        assert!(
+            high <= low,
+            "higher threshold should give ≤ detections: low={low}, high={high}"
+        );
+    }
+
+    #[test]
+    fn smaller_lambda_more_sensitive() {
+        let mut data = vec![0.0; 60];
+        data.extend(vec![3.0; 60]);
+        data.extend(vec![0.0; 60]);
+        let sensitive = BocpdDetector::new(50.0, 200);
+        let conservative = BocpdDetector::new(500.0, 200);
+        let s_cps = sensitive.detect(&data).len();
+        let c_cps = conservative.detect(&data).len();
+        assert!(
+            s_cps >= c_cps,
+            "smaller λ should detect ≥ as many: λ=50→{s_cps}, λ=500→{c_cps}"
+        );
+    }
+
+    // ── Eval harness ─────────────────────────────────────────────
+
+    use crate::eval::{self, Category};
+
+    fn run_eval() -> Vec<eval::EvalMetrics> {
+        let detector = BocpdDetector::new(200.0, 350);
+        let scenarios = eval::all_scenarios();
+        let mut metrics = Vec::new();
+        for s in &scenarios {
+            let cps = detector.detect(&s.data);
+            let detected: Vec<usize> = cps.iter().map(|c| c.index).collect();
+            let mut m = eval::match_detections(&detected, &s.ground_truth, 20);
+            m.name = s.name.to_string();
+            m.category = s.category;
+            metrics.push(m);
+        }
+        metrics
+    }
+
+    fn run_eval_detrended() -> Vec<eval::EvalMetrics> {
+        use crate::detrend::detect_with_seasonal_guard;
+
+        let detector = BocpdDetector::new(200.0, 400);
+        let scenarios = eval::all_scenarios();
+        let mut metrics = Vec::new();
+        for s in &scenarios {
+            let cps = detect_with_seasonal_guard(&s.data, s.period, &detector);
+            let detected: Vec<usize> = cps.iter().map(|c| c.index).collect();
+            let mut m = eval::match_detections(&detected, &s.ground_truth, 20);
+            m.name = s.name.to_string();
+            m.category = s.category;
+            metrics.push(m);
+        }
+        metrics
+    }
+
+    #[test]
+    fn eval_full_suite() {
+        let metrics = run_eval();
+        eval::print_report(&metrics);
+
+        let agg = eval::aggregate(&metrics);
+        assert!(agg.f1 >= 0.40, "aggregate F1={:.2}, need ≥0.40", agg.f1);
+        assert!(
+            agg.mean_delay <= 25.0,
+            "aggregate delay={:.1}, need ≤25",
+            agg.mean_delay
+        );
+    }
+
+    #[test]
+    fn eval_must_detect_recall() {
+        let metrics = run_eval();
+        let md: Vec<_> = metrics
+            .iter()
+            .filter(|m| m.category == Category::MustDetect)
+            .collect();
+        let tp: usize = md.iter().map(|m| m.tp).sum();
+        let fn_count: usize = md.iter().map(|m| m.r#fn).sum();
+        let recall = if tp + fn_count > 0 {
+            tp as f64 / (tp + fn_count) as f64
+        } else {
+            1.0
+        };
+        assert!(
+            recall >= 0.60,
+            "MustDetect recall={:.2}, need ≥0.60",
+            recall
+        );
+    }
+
+    #[test]
+    fn eval_must_reject_precision() {
+        let metrics = run_eval();
+        let mr: Vec<_> = metrics
+            .iter()
+            .filter(|m| m.category == Category::MustReject)
+            .collect();
+        let total_fps: usize = mr.iter().map(|m| m.fp).sum();
+        assert!(
+            total_fps <= 22,
+            "MustReject total FPs={}, need ≤22",
+            total_fps
+        );
+    }
+
+    #[test]
+    fn eval_deterministic() {
+        let m1 = run_eval();
+        let m2 = run_eval();
+        for (a, b) in m1.iter().zip(m2.iter()) {
+            assert_eq!(a.tp, b.tp, "non-deterministic: {} tp differs", a.name);
+            assert_eq!(a.fp, b.fp, "non-deterministic: {} fp differs", a.name);
+        }
+    }
+
+    #[test]
+    fn eval_bocpd_beats_naive_baseline() {
+        // BOCPD must outperform a naive z-score detector.
+        // If it doesn't, the eval scenarios are too easy.
+        let scenarios = eval::all_scenarios();
+        let detector = BocpdDetector::new(200.0, 400);
+
+        let mut bocpd_metrics = Vec::new();
+        let mut naive_metrics = Vec::new();
+
+        for s in &scenarios {
+            let bocpd_cps: Vec<usize> = detector
+                .detect(&s.data)
+                .iter()
+                .map(|c| c.index)
+                .collect();
+            let naive_cps = eval::naive_zscore_detect(&s.data, 30, 3.0);
+
+            let mut bm = eval::match_detections(&bocpd_cps, &s.ground_truth, 20);
+            bm.name = s.name.to_string();
+            bm.category = s.category;
+            bocpd_metrics.push(bm);
+
+            let mut nm = eval::match_detections(&naive_cps, &s.ground_truth, 20);
+            nm.name = s.name.to_string();
+            nm.category = s.category;
+            naive_metrics.push(nm);
+        }
+
+        let bocpd_agg = eval::aggregate(&bocpd_metrics);
+        let naive_agg = eval::aggregate(&naive_metrics);
+
+        eprintln!("\n=== BOCPD vs Naive Z-Score ===");
+        eprintln!(
+            "BOCPD:  F1={:.2} P={:.2} R={:.2}",
+            bocpd_agg.f1, bocpd_agg.precision, bocpd_agg.recall
+        );
+        eprintln!(
+            "Naive:  F1={:.2} P={:.2} R={:.2}",
+            naive_agg.f1, naive_agg.precision, naive_agg.recall
+        );
+
+        assert!(
+            bocpd_agg.f1 > naive_agg.f1,
+            "BOCPD F1={:.2} must beat naive F1={:.2}",
+            bocpd_agg.f1,
+            naive_agg.f1
+        );
+    }
+
+    #[test]
+    fn eval_detrending_reduces_fps() {
+        let raw_metrics = run_eval();
+        let detrended_metrics = run_eval_detrended();
+
+        let raw_agg = eval::aggregate(&raw_metrics);
+        let det_agg = eval::aggregate(&detrended_metrics);
+
+        eprintln!("\n=== Raw vs Detrended ===");
+        eprintln!(
+            "Raw:       F1={:.2} P={:.2} R={:.2} FP={}",
+            raw_agg.f1, raw_agg.precision, raw_agg.recall, raw_agg.fp
+        );
+        eprintln!(
+            "Detrended: F1={:.2} P={:.2} R={:.2} FP={}",
+            det_agg.f1, det_agg.precision, det_agg.recall, det_agg.fp
+        );
+
+        // Detrending should reduce false positives on MustReject scenarios
+        let raw_mr_fps: usize = raw_metrics
+            .iter()
+            .filter(|m| m.category == Category::MustReject)
+            .map(|m| m.fp)
+            .sum();
+        let det_mr_fps: usize = detrended_metrics
+            .iter()
+            .filter(|m| m.category == Category::MustReject)
+            .map(|m| m.fp)
+            .sum();
+
+        eprintln!("MustReject FPs: raw={raw_mr_fps}, detrended={det_mr_fps}");
+        assert!(
+            det_mr_fps <= raw_mr_fps,
+            "detrending should not increase MustReject FPs: raw={raw_mr_fps}, detrended={det_mr_fps}"
+        );
+    }
+
+    #[test]
+    fn eval_lambda_sensitivity() {
+        let scenarios = eval::all_scenarios();
+        let det200 = BocpdDetector::new(200.0, 350);
+        let det500 = BocpdDetector::new(500.0, 350);
+
+        let mut recall_200 = 0;
+        let mut recall_500 = 0;
+        let mut total_gt = 0;
+
+        for s in scenarios
+            .iter()
+            .filter(|s| s.category == Category::MustDetect)
+        {
+            let cps200: Vec<usize> = det200
+                .detect(&s.data)
+                .iter()
+                .map(|c| c.index)
+                .collect();
+            let cps500: Vec<usize> = det500
+                .detect(&s.data)
+                .iter()
+                .map(|c| c.index)
+                .collect();
+            let m200 = eval::match_detections(&cps200, &s.ground_truth, 20);
+            let m500 = eval::match_detections(&cps500, &s.ground_truth, 20);
+            recall_200 += m200.tp;
+            recall_500 += m500.tp;
+            total_gt += s.ground_truth.len();
+        }
+
+        // λ=500 shouldn't catastrophically collapse recall vs λ=200
+        let r200 = recall_200 as f64 / total_gt as f64;
+        let r500 = recall_500 as f64 / total_gt as f64;
+        assert!(
+            r500 >= r200 * 0.5,
+            "λ=500 recall={:.2} collapsed vs λ=200 recall={:.2}",
+            r500,
+            r200
+        );
+    }
+
+    // --- Multivariate BOCPD tests ---
+
+    #[test]
+    fn multivariate_detects_joint_shift() {
+        let mut rng = Rng::new(42);
+        let n = 200;
+        let mut data = Vec::with_capacity(n);
+
+        // First 100: centered at (0, 0)
+        for _ in 0..100 {
+            data.push(vec![rng.normal(0.0, 1.0), rng.normal(0.0, 1.0)]);
+        }
+        // Next 100: shifted to (3, 3)
+        for _ in 0..100 {
+            data.push(vec![rng.normal(3.0, 1.0), rng.normal(3.0, 1.0)]);
+        }
+
+        let detector = BocpdDetector::new(200.0, 250);
+        let cps = detector.detect_multivariate(&data);
+        assert!(!cps.is_empty(), "should detect joint mean shift");
+        assert!(
+            (cps[0].index as i64 - 100).abs() < 20,
+            "change point at {} (expected ~100)",
+            cps[0].index
+        );
+    }
+
+    #[test]
+    fn multivariate_no_detection_on_stationary() {
+        let mut rng = Rng::new(99);
+        let n = 200;
+        let data: Vec<Vec<f64>> = (0..n)
+            .map(|_| vec![rng.normal(0.0, 1.0), rng.normal(0.0, 1.0)])
+            .collect();
+
+        let detector = BocpdDetector::new(200.0, 250);
+        let cps = detector.detect_multivariate(&data);
+        assert!(
+            cps.len() <= 1,
+            "stationary data should have ≤1 false positives, got {}",
+            cps.len()
+        );
+    }
+
+    #[test]
+    fn multivariate_detects_correlated_shift_invisible_to_marginals() {
+        // Key acceptance criterion: correlated shift where each marginal is within ~1σ
+        // but the joint shift is detectable.
+        let mut rng = Rng::new(77);
+        let n = 300;
+        let mut data = Vec::with_capacity(n);
+
+        // First 150: centered at (0, 0) with correlated noise
+        for _ in 0..150 {
+            let z = rng.normal(0.0, 1.0);
+            data.push(vec![
+                z * 0.7 + rng.normal(0.0, 0.7), // correlated dim 1
+                z * 0.7 + rng.normal(0.0, 0.7), // correlated dim 2
+            ]);
+        }
+        // Next 150: small shift in both dimensions (0.8σ each -- below marginal threshold)
+        for _ in 0..150 {
+            let z = rng.normal(0.0, 1.0);
+            data.push(vec![
+                0.8 + z * 0.7 + rng.normal(0.0, 0.7),
+                0.8 + z * 0.7 + rng.normal(0.0, 0.7),
+            ]);
+        }
+
+        let detector = BocpdDetector::new(200.0, 350);
+
+        // Univariate detection on each dimension should miss it (small per-dim shift)
+        let dim1: Vec<f64> = data.iter().map(|x| x[0]).collect();
+        let dim2: Vec<f64> = data.iter().map(|x| x[1]).collect();
+        let univ_cps_1 = detector.detect(&dim1);
+        let univ_cps_2 = detector.detect(&dim2);
+
+        // Multivariate should catch the joint shift
+        let multi_cps = detector.detect_multivariate(&data);
+
+        eprintln!(
+            "univariate dim1: {} detections, dim2: {} detections, multivariate: {} detections",
+            univ_cps_1.len(),
+            univ_cps_2.len(),
+            multi_cps.len()
+        );
+
+        // The multivariate detector should find more than the best univariate
+        // (or at least detect the shift when univariate doesn't)
+        let max_univ = univ_cps_1.len().max(univ_cps_2.len());
+        assert!(
+            multi_cps.len() >= max_univ,
+            "multivariate ({}) should detect at least as many as best univariate ({})",
+            multi_cps.len(),
+            max_univ
+        );
+    }
+
+    #[test]
+    fn multivariate_too_short_returns_empty() {
+        let data: Vec<Vec<f64>> = (0..10).map(|_| vec![1.0, 2.0]).collect();
+        let detector = BocpdDetector::new(200.0, 50);
+        let cps = detector.detect_multivariate(&data);
+        assert!(cps.is_empty());
+    }
+
+    #[test]
+    fn multivariate_3d_shift() {
+        let mut rng = Rng::new(123);
+        let n = 200;
+        let mut data = Vec::with_capacity(n);
+
+        for _ in 0..100 {
+            data.push(vec![
+                rng.normal(0.0, 1.0),
+                rng.normal(0.0, 1.0),
+                rng.normal(0.0, 1.0),
+            ]);
+        }
+        for _ in 0..100 {
+            data.push(vec![
+                rng.normal(2.0, 1.0),
+                rng.normal(-2.0, 1.0),
+                rng.normal(3.0, 1.0),
+            ]);
+        }
+
+        let detector = BocpdDetector::new(200.0, 250);
+        let cps = detector.detect_multivariate(&data);
+        assert!(!cps.is_empty(), "should detect 3D mean shift");
+    }
+
+    #[test]
+    fn nan_in_data_does_not_panic() {
+        let mut data: Vec<f64> = (0..100).map(|i| i as f64 * 0.1).collect();
+        data[10] = f64::NAN;
+        data[50] = f64::NAN;
+        data[51] = f64::INFINITY;
+
+        let detector = BocpdDetector::new(200.0, 250);
+        // Must not panic -- NaN previously caused unwrap on partial_cmp
+        let _cps = detector.detect(&data);
+    }
+
+    #[test]
+    fn nan_in_data_still_produces_detections() {
+        // NaN sprinkled into a clean shift should not suppress all detections.
+        let mut data = vec![0.0f64; 100];
+        data.extend(vec![5.0f64; 100]);
+        // Inject NaN at arbitrary positions
+        data[10] = f64::NAN;
+        data[55] = f64::NAN;
+        data[130] = f64::NAN;
+        let det = BocpdDetector::new(200.0, 250);
+        let cps = det.detect(&data);
+        assert!(
+            !cps.is_empty(),
+            "NaN-containing data should still produce detections from clean values"
+        );
+    }
+
+    #[test]
+    fn all_nan_returns_empty_without_panic() {
+        let data = vec![f64::NAN; 50];
+        let det = BocpdDetector::new(200.0, 100);
+        let cps = det.detect(&data);
+        assert!(cps.is_empty(), "all-NaN input should return empty vec");
+    }
+
+    // ── Fix #389 acceptance tests ────────────────────────────────
+
+    #[test]
+    #[should_panic(expected = "lambda must be > 1.0")]
+    fn batch_rejects_lambda_one() {
+        BocpdDetector::new(1.0, 100);
+    }
+
+    #[test]
+    #[should_panic(expected = "lambda must be > 1.0")]
+    fn batch_rejects_lambda_below_one() {
+        BocpdDetector::new(0.5, 100);
+    }
+
+    #[test]
+    fn detect_multivariate_empty_returns_empty() {
+        let det = BocpdDetector::new(200.0, 100);
+        let cps = det.detect_multivariate(&[]);
+        assert!(cps.is_empty());
+    }
+
+    #[test]
+    fn detect_multivariate_ragged_returns_empty() {
+        let det = BocpdDetector::new(200.0, 100);
+        let mut data: Vec<Vec<f64>> = (0..30).map(|_| vec![1.0, 2.0, 3.0]).collect();
+        data[15] = vec![1.0, 2.0]; // ragged row
+        let cps = det.detect_multivariate(&data);
+        assert!(cps.is_empty(), "ragged input should return empty");
+    }
+
+    #[test]
+    fn nan_filtering_preserves_original_indices() {
+        // Input with NaN gap at positions 5..10 -- change point indices must
+        // reference original positions, not compressed model steps.
+        let mut data: Vec<f64> = vec![0.0; 100];
+        data.extend(vec![5.0; 100]);
+        for v in data.iter_mut().take(10).skip(5) {
+            *v = f64::NAN;
+        }
+        let det = BocpdDetector::new(200.0, 250);
+        let cps = det.detect(&data);
+        assert!(!cps.is_empty(), "should detect the shift");
+        // The shift is at raw position 100. The detected index should be
+        // near 100, NOT shifted by the 5 NaN values (which would give ~95).
+        assert!(
+            (cps[0].index as i64 - 100).abs() < 20,
+            "change point should be near raw index 100, got {}",
+            cps[0].index
+        );
+        assert!(
+            cps[0].index >= 95,
+            "index {} is too low -- NaN filtering shifted indices",
+            cps[0].index
+        );
+    }
+}

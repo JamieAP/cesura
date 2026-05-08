@@ -14,6 +14,9 @@ pub struct DetectorState {
     pub rl_log: Vec<f64>,
     pub stats: Vec<NigState>,
     pub map_rls: Vec<usize>,
+    /// Per-step posterior P(r_t = 0). Optional for forward-compat with v0.2 snapshots.
+    #[serde(default)]
+    pub cp_probs: Vec<f64>,
     pub total_steps: usize,
     pub last_detection: usize,
     pub welford: WelfordState,
@@ -26,6 +29,10 @@ pub struct DetectorState {
     /// Maps model step → raw input position.
     #[serde(default)]
     pub raw_index_map: Vec<usize>,
+    /// β-divergence robustness parameter. 0 = standard Bayesian update.
+    /// Forward-compat: pre-0.6 snapshots without this field default to 0.
+    #[serde(default)]
+    pub beta: f64,
 }
 
 /// Serializable NIG sufficient statistics.
@@ -109,16 +116,31 @@ impl Default for WelfordState {
     }
 }
 
+/// Detection awaiting its post-window. Held until enough observations
+/// have accumulated to compute `shift_sigma` from a real before/after window.
+#[derive(Debug, Clone)]
+struct PendingCp {
+    raw_index: usize,
+    fire_step: usize,
+    confidence: f64,
+}
+
 /// Streaming BOCPD detector -- maintains state between calls to `step()`.
 pub struct StreamingDetector {
     hazard_log: f64,
     growth_log: f64,
     max_rl: usize,
+    log_mass_cutoff: f64,
+    /// β-divergence robustness parameter (see [`crate::BocpdDetector::with_beta`]).
+    /// `0.0` ⇒ standard BOCPD (default, short-circuited).
+    beta: f64,
     prior: Nig,
     // Mutable state
     rl_log: Vec<f64>,
     stats: Vec<Nig>,
     map_rls: Vec<usize>,
+    /// Per-step posterior P(r_t = 0). Same length as `map_rls`.
+    cp_probs: Vec<f64>,
     total_steps: usize,
     last_detection: usize,
     welford: WelfordState,
@@ -129,6 +151,34 @@ pub struct StreamingDetector {
     // Pre-allocated scratch buffers (avoid per-step allocation)
     scratch_rl: Vec<f64>,
     scratch_stats: Vec<Nig>,
+    /// Ring buffer of last `2 * SHIFT_WINDOW` normalised observations,
+    /// used to compute `shift_sigma` from a proper before/after window.
+    norm_ring: std::collections::VecDeque<f64>,
+    /// Detections fired but awaiting a full post-window.
+    pending: Vec<PendingCp>,
+}
+
+const SHIFT_WINDOW: usize = 20;
+
+/// Compute |mean(after) - mean(before)| from the ring buffer.
+/// `total_steps` is the step count after the most recent observation.
+/// `fire_step` is the step count at the moment the candidate was triggered.
+fn compute_shift_sigma(
+    ring: &std::collections::VecDeque<f64>,
+    total_steps: usize,
+    fire_step: usize,
+) -> f64 {
+    let len = ring.len();
+    let post = total_steps.saturating_sub(fire_step).min(SHIFT_WINDOW);
+    let pre = (len.saturating_sub(post)).min(SHIFT_WINDOW);
+    if pre == 0 || post == 0 {
+        return 0.0;
+    }
+    let split = len - post;
+    let before_start = split - pre;
+    let mean_b: f64 = ring.iter().skip(before_start).take(pre).sum::<f64>() / pre as f64;
+    let mean_a: f64 = ring.iter().skip(split).take(post).sum::<f64>() / post as f64;
+    (mean_a - mean_b).abs()
 }
 
 impl StreamingDetector {
@@ -151,10 +201,13 @@ impl StreamingDetector {
             hazard_log: h.ln(),
             growth_log: (1.0 - h).ln(),
             max_rl: max_run_length,
+            log_mass_cutoff: crate::DEFAULT_MASS_CUTOFF.ln(),
+            beta: 0.0,
             prior: prior.clone(),
             rl_log,
             stats: vec![prior.clone(); max_run_length + 1],
             map_rls: Vec::new(),
+            cp_probs: Vec::new(),
             total_steps: 0,
             last_detection: 0,
             welford: WelfordState::new(),
@@ -162,11 +215,38 @@ impl StreamingDetector {
             raw_index_map: Vec::new(),
             scratch_rl: vec![f64::NEG_INFINITY; max_run_length + 1],
             scratch_stats: vec![prior; max_run_length + 1],
+            norm_ring: std::collections::VecDeque::with_capacity(2 * SHIFT_WINDOW),
+            pending: Vec::new(),
         }
     }
 
+    /// Opt into β-divergence robust BOCPD (see [`crate::BocpdDetector::with_beta`]).
+    /// `beta = 0.0` is the default and short-circuits to standard cesura.
+    /// β is persisted in [`DetectorState`] and survives `save_state`/`restore`.
+    ///
+    /// # Panics
+    /// Panics if `beta < 0.0` or `beta > 1.0`.
+    pub fn with_beta(mut self, beta: f64) -> Self {
+        assert!(
+            (0.0..=1.0).contains(&beta),
+            "beta must be in [0.0, 1.0], got {beta}"
+        );
+        self.beta = beta;
+        self
+    }
+
+    /// Set the mass-pruning cutoff (see [`crate::BocpdDetector::with_mass_cutoff`]).
+    pub fn with_mass_cutoff(mut self, cutoff: f64) -> Self {
+        self.log_mass_cutoff = if cutoff > 0.0 {
+            cutoff.ln()
+        } else {
+            f64::NEG_INFINITY
+        };
+        self
+    }
+
     /// Process new observations incrementally. Returns any new change points.
-    pub fn step(&mut self, observations: &[f64], threshold: f64) -> Vec<ChangePoint> {
+    pub fn step(&mut self, observations: &[f64]) -> Vec<ChangePoint> {
         let mut result = Vec::new();
 
         for &x in observations {
@@ -187,25 +267,28 @@ impl StreamingDetector {
             for v in self.scratch_rl.iter_mut() {
                 *v = f64::NEG_INFINITY;
             }
-            let mut cp_acc = f64::NEG_INFINITY;
+            let mut prev_mass = f64::NEG_INFINITY;
 
             for r in 0..=active.min(self.max_rl.saturating_sub(1)) {
                 if self.rl_log[r] == f64::NEG_INFINITY {
                     continue;
                 }
-                let pred = self.stats[r].log_predictive(xn);
+                let pred = self.stats[r].log_predictive_robust(xn, self.beta);
                 if !pred.is_finite() {
                     continue;
                 }
-                let joint = self.rl_log[r] + pred;
-
                 if r < self.max_rl {
                     self.scratch_rl[r + 1] =
-                        log_add_exp(self.scratch_rl[r + 1], joint + self.growth_log);
+                        log_add_exp(self.scratch_rl[r + 1], self.rl_log[r] + pred + self.growth_log);
                 }
-                cp_acc = log_add_exp(cp_acc, joint + self.hazard_log);
+                prev_mass = log_add_exp(prev_mass, self.rl_log[r]);
             }
-            self.scratch_rl[0] = cp_acc;
+            let prior_pred = self.prior.log_predictive_robust(xn, self.beta);
+            self.scratch_rl[0] = if prior_pred.is_finite() && prev_mass.is_finite() {
+                prev_mass + self.hazard_log + prior_pred
+            } else {
+                f64::NEG_INFINITY
+            };
 
             // Normalize
             let evidence = self
@@ -220,6 +303,16 @@ impl StreamingDetector {
                 }
             }
 
+            // Mass-prune the tail: data-adaptive truncation.
+            if self.log_mass_cutoff > f64::NEG_INFINITY {
+                for r in (1..=self.max_rl).rev() {
+                    if self.scratch_rl[r] >= self.log_mass_cutoff {
+                        break;
+                    }
+                    self.scratch_rl[r] = f64::NEG_INFINITY;
+                }
+            }
+
             // MAP run length
             let map_r = self
                 .scratch_rl
@@ -230,6 +323,11 @@ impl StreamingDetector {
                 .map(|(r, _)| r)
                 .unwrap_or(0);
             self.map_rls.push(map_r);
+            self.cp_probs.push(if self.scratch_rl[0].is_finite() {
+                self.scratch_rl[0].exp()
+            } else {
+                0.0
+            });
             self.raw_index_map.push(current_raw);
 
             // Update sufficient stats in scratch buffer
@@ -247,11 +345,39 @@ impl StreamingDetector {
             std::mem::swap(&mut self.stats, &mut self.scratch_stats);
             self.total_steps += 1;
 
-            // Change point detection (same logic as batch)
+            // Maintain ring buffer of last 2*SHIFT_WINDOW normalised values
+            // for proper shift_sigma computation at detection emission time.
+            self.norm_ring.push_back(xn);
+            while self.norm_ring.len() > 2 * SHIFT_WINDOW {
+                self.norm_ring.pop_front();
+            }
+
+            // Drain any pending detections whose post-window is now full.
+            self.pending.retain(|p| {
+                if self.total_steps >= p.fire_step + SHIFT_WINDOW {
+                    let shift_sigma = compute_shift_sigma(
+                        &self.norm_ring,
+                        self.total_steps,
+                        p.fire_step,
+                    );
+                    if shift_sigma >= 1e-9 {
+                        result.push(ChangePoint {
+                            index: p.raw_index,
+                            confidence: p.confidence,
+                            shift_sigma,
+                        });
+                    }
+                    false
+                } else {
+                    true
+                }
+            });
+
+            // Change point detection (same trigger logic as batch).
             let drop_to = 3;
             let min_prev_rl = 30;
             let cooldown = 15;
-            let i = self.total_steps - 1; // current index in map_rls
+            let i = self.total_steps - 1;
 
             if i >= min_prev_rl && self.map_rls[i] <= drop_to && i - self.last_detection >= cooldown
             {
@@ -261,20 +387,18 @@ impl StreamingDetector {
                     .max()
                     .unwrap_or(0);
                 if prev_max >= min_prev_rl {
-                    let confidence =
-                        (1.0 - self.map_rls[i] as f64 / prev_max as f64).clamp(0.0, 1.0);
-                    if confidence >= threshold {
-                        // Approximate shift_sigma from confidence
-                        // (exact normalized data not stored in streaming mode)
-                        let shift_sigma = confidence * 5.0;
-
-                        result.push(ChangePoint {
-                            index: self.raw_index_map[i],
-                            confidence,
-                            shift_sigma,
-                        });
-                        self.last_detection = i;
-                    }
+                    let look_back = cooldown.min(i);
+                    let confidence = self.cp_probs[i.saturating_sub(look_back)..=i]
+                        .iter()
+                        .copied()
+                        .fold(0.0_f64, f64::max)
+                        .clamp(0.0, 1.0);
+                    self.last_detection = i;
+                    self.pending.push(PendingCp {
+                        raw_index: self.raw_index_map[i],
+                        fire_step: self.total_steps,
+                        confidence,
+                    });
                 }
             }
         }
@@ -293,6 +417,7 @@ impl StreamingDetector {
                 .collect(),
             stats: self.stats.iter().map(NigState::from).collect(),
             map_rls: self.map_rls.clone(),
+            cp_probs: self.cp_probs.clone(),
             total_steps: self.total_steps,
             last_detection: self.last_detection,
             welford: self.welford.clone(),
@@ -301,6 +426,7 @@ impl StreamingDetector {
             max_rl: self.max_rl,
             raw_steps: self.raw_steps,
             raw_index_map: self.raw_index_map.clone(),
+            beta: self.beta,
         }
     }
 
@@ -332,6 +458,8 @@ impl StreamingDetector {
             hazard_log: state.hazard_log,
             growth_log: state.growth_log,
             max_rl: state.max_rl,
+            log_mass_cutoff: crate::DEFAULT_MASS_CUTOFF.ln(),
+            beta: state.beta,
             prior: prior.clone(),
             rl_log: state
                 .rl_log
@@ -346,6 +474,12 @@ impl StreamingDetector {
                 .collect(),
             stats: state.stats.iter().map(Nig::from).collect(),
             map_rls: state.map_rls,
+            cp_probs: if state.cp_probs.is_empty() {
+                // v0.2 forward-compat: synthesise zeros so old snapshots still load.
+                vec![0.0; state.total_steps]
+            } else {
+                state.cp_probs
+            },
             total_steps: state.total_steps,
             last_detection: state.last_detection,
             welford: state.welford,
@@ -353,6 +487,8 @@ impl StreamingDetector {
             raw_index_map: state.raw_index_map,
             scratch_rl: vec![f64::NEG_INFINITY; state.max_rl + 1],
             scratch_stats: vec![prior; state.max_rl + 1],
+            norm_ring: std::collections::VecDeque::with_capacity(2 * SHIFT_WINDOW),
+            pending: Vec::new(),
         })
     }
 
@@ -377,7 +513,7 @@ mod tests {
         let data: Vec<f64> = std::iter::repeat_n(0.0, 100)
             .chain(std::iter::repeat_n(5.0, 100))
             .collect();
-        let cps = det.step(&data, 0.3);
+        let cps = det.step(&data);
         assert!(!cps.is_empty(), "should detect the mean shift");
         assert!(
             (cps[0].index as i64 - 100).abs() < 20,
@@ -390,7 +526,7 @@ mod tests {
     fn streaming_no_detection_on_constant() {
         let mut det = StreamingDetector::new(200.0, 250);
         let data = vec![1.0; 200];
-        let cps = det.step(&data, 0.3);
+        let cps = det.step(&data);
         assert!(cps.is_empty(), "constant signal should have no detections");
     }
 
@@ -402,13 +538,13 @@ mod tests {
 
         // Batch
         let mut det_batch = StreamingDetector::new(200.0, 250);
-        let batch_cps = det_batch.step(&data, 0.3);
+        let batch_cps = det_batch.step(&data);
 
         // Incremental (10-point chunks)
         let mut det_inc = StreamingDetector::new(200.0, 250);
         let mut inc_cps = Vec::new();
         for chunk in data.chunks(10) {
-            inc_cps.extend(det_inc.step(chunk, 0.3));
+            inc_cps.extend(det_inc.step(chunk));
         }
 
         assert_eq!(
@@ -432,7 +568,7 @@ mod tests {
     fn state_save_restore() {
         let mut det = StreamingDetector::new(200.0, 250);
         let phase1: Vec<f64> = std::iter::repeat_n(0.0, 80).collect();
-        det.step(&phase1, 0.3);
+        det.step(&phase1);
 
         // Save state
         let state = det.save_state();
@@ -445,8 +581,8 @@ mod tests {
 
         // Continue with same data on both
         let phase2: Vec<f64> = std::iter::repeat_n(5.0, 120).collect();
-        let cps1 = det.step(&phase2, 0.3);
-        let cps2 = det2.step(&phase2, 0.3);
+        let cps1 = det.step(&phase2);
+        let cps2 = det2.step(&phase2);
 
         assert_eq!(det.total_steps(), det2.total_steps());
         assert_eq!(
@@ -465,7 +601,7 @@ mod tests {
     #[test]
     fn state_serde_roundtrip() {
         let mut det = StreamingDetector::new(200.0, 250);
-        det.step(&[1.0, 2.0, 3.0], 0.3);
+        det.step(&[1.0, 2.0, 3.0]);
         let state = det.save_state();
         let json = serde_json::to_string(&state).unwrap();
         let restored: DetectorState = serde_json::from_str(&json).unwrap();
@@ -481,7 +617,7 @@ mod tests {
         data[20] = f64::NAN;
         data[110] = f64::NAN;
         // Must not panic
-        let cps = det.step(&data, 0.3);
+        let cps = det.step(&data);
         assert!(
             !cps.is_empty(),
             "NaN-containing data should still produce detections"
@@ -492,7 +628,7 @@ mod tests {
     fn all_nan_step_returns_empty_without_panic() {
         let mut det = StreamingDetector::new(200.0, 100);
         let data = vec![f64::NAN; 50];
-        let cps = det.step(&data, 0.3);
+        let cps = det.step(&data);
         assert!(cps.is_empty(), "all-NaN step should return empty vec");
     }
 
@@ -553,7 +689,7 @@ mod tests {
         let mut data = vec![0.0; 80];
         data.extend(vec![5.0; 80]);
         data.extend(vec![-3.0; 80]);
-        let cps = det.step(&data, 0.3);
+        let cps = det.step(&data);
         assert!(
             cps.len() >= 2,
             "should detect ≥2 regime changes, got {}",
@@ -574,10 +710,10 @@ mod tests {
         data.extend(vec![5.0; 100]);
 
         let batch = BocpdDetector::new(200.0, 250);
-        let batch_cps = batch.detect(&data, 0.3);
+        let batch_cps = batch.detect(&data);
 
         let mut streaming = StreamingDetector::new(200.0, 250);
-        let stream_cps = streaming.step(&data, 0.3);
+        let stream_cps = streaming.step(&data);
 
         assert!(!batch_cps.is_empty(), "batch should detect");
         assert!(!stream_cps.is_empty(), "streaming should detect");
@@ -600,10 +736,10 @@ mod tests {
         data.extend((0..150).map(|_| rng.normal(5.0, 1.0)));
 
         let batch = BocpdDetector::new(200.0, 350);
-        let batch_cps = batch.detect(&data, 0.3);
+        let batch_cps = batch.detect(&data);
 
         let mut streaming = StreamingDetector::new(200.0, 350);
-        let stream_cps = streaming.step(&data, 0.3);
+        let stream_cps = streaming.step(&data);
 
         assert!(!batch_cps.is_empty(), "batch should detect noisy shift");
         assert!(
@@ -628,10 +764,10 @@ mod tests {
         let data: Vec<f64> = (0..300).map(|_| rng.normal(0.0, 1.0)).collect();
 
         let batch = BocpdDetector::new(200.0, 350);
-        let batch_cps = batch.detect(&data, 0.5);
+        let batch_cps = batch.detect(&data);
 
         let mut streaming = StreamingDetector::new(200.0, 350);
-        let stream_cps = streaming.step(&data, 0.5);
+        let stream_cps = streaming.step(&data);
 
         // Both should have very few (ideally zero) false positives
         assert!(
@@ -656,7 +792,7 @@ mod tests {
 
         for s in &scenarios {
             let mut det = StreamingDetector::new(200.0, 350);
-            let cps = det.step(&s.data, 0.3);
+            let cps = det.step(&s.data);
             let detected: Vec<usize> = cps.iter().map(|c| c.index).collect();
             let mut m = eval::match_detections(&detected, &s.ground_truth, 25); // wider tolerance for streaming
             m.name = s.name.to_string();
@@ -700,7 +836,7 @@ mod tests {
     #[test]
     fn restore_rejects_mismatched_rl_log() {
         let mut det = StreamingDetector::new(200.0, 100);
-        det.step(&[1.0, 2.0, 3.0], 0.3);
+        det.step(&[1.0, 2.0, 3.0]);
         let mut state = det.save_state();
         state.rl_log.push(0.0); // make it too long
         match StreamingDetector::restore(state) {
@@ -712,7 +848,7 @@ mod tests {
     #[test]
     fn restore_rejects_mismatched_stats() {
         let mut det = StreamingDetector::new(200.0, 100);
-        det.step(&[1.0, 2.0, 3.0], 0.3);
+        det.step(&[1.0, 2.0, 3.0]);
         let mut state = det.save_state();
         state.stats.pop(); // make it too short
         match StreamingDetector::restore(state) {
@@ -744,7 +880,7 @@ mod tests {
             *v = f64::NAN;
         }
         let mut det = StreamingDetector::new(200.0, 250);
-        let cps = det.step(&data, 0.3);
+        let cps = det.step(&data);
         assert!(!cps.is_empty(), "should detect the shift");
         // raw_steps should equal total input length (including NaN)
         assert_eq!(det.raw_steps, 200);
@@ -776,14 +912,14 @@ mod tests {
         // Warm up with 50 points each
         for det in &mut detectors {
             let warmup: Vec<f64> = (0..50).map(|i| (i as f64 * 0.1).sin()).collect();
-            det.step(&warmup, 0.3);
+            det.step(&warmup);
         }
 
         // Benchmark: 5 new points per signal (simulating 5m capture at 1m step)
         let tick_data: Vec<f64> = vec![1.0, 1.1, 0.9, 1.2, 0.8];
         let start = Instant::now();
         for det in &mut detectors {
-            det.step(&tick_data, 0.3);
+            det.step(&tick_data);
         }
         let elapsed = start.elapsed();
 
