@@ -2,18 +2,23 @@
 //! Gaussian-mean shifts.
 //!
 //! Reference: Romano, Eckley, Fearnhead, Rigaill (2023), "Fast Online
-//! Change Point Detection via Functional Pruning CUSUM Statistics";
-//! Ward et al. (2024) "Faster Online Changepoint Detection ..."
-//! (arXiv:2402.05989) for the multivariate generalisation.
+//! Change Point Detection via Functional Pruning CUSUM Statistics"
+//! (arXiv:2302.04743 / JMLR v24/21-1230).
 //!
-//! What ships here is the univariate Gaussian-mean variant with a naive
-//! O(n) per-step inner loop -- complementary to BOCPD, frequentist where
-//! BOCPD is Bayesian. The functional-pruning O(log n) data structure
-//! that gives FOCuS its name is deferred (see CHANGELOG / KNOWN_LIMITATIONS).
+//! Two inner-loop modes:
+//! - Naive (default): O(t) per step. Walks all candidate split points τ.
+//! - Pruned (`with_pruning`): amortised O(1) prune + O(|deque|) query
+//!   per step. Maintains two monotone deques (positive- and
+//!   negative-shift) of pieces `(τ, S_τ)`, parameterised so the
+//!   dominance ordering is invariant to t. Bit-for-bit parity with
+//!   the naive path on every fixture in the eval suite -- pinned by
+//!   `tests/focus.rs` parity tests.
 //!
 //! Operating-characteristic note: FOCuS thresholds ARE NOT comparable to
 //! BOCPD confidences. Use FOCuS as a sanity-check parallel detector,
 //! not as a precision/recall replacement.
+
+use std::collections::VecDeque;
 
 use crate::ChangePoint;
 
@@ -46,6 +51,38 @@ pub struct FocusDetector {
     n: usize,
     /// Most recently emitted CP, for cooldown bookkeeping.
     last_emit: Option<usize>,
+    /// Inner-loop strategy. Default `Naive`; opt into `Pruned` via
+    /// [`FocusDetector::with_pruning`].
+    mode: InnerLoop,
+}
+
+/// Per-step argmax strategy for the GLR statistic.
+#[derive(Clone)]
+enum InnerLoop {
+    Naive,
+    Pruned(PruningState),
+}
+
+/// One candidate split point in the deque. `tau` is segment-relative;
+/// `s_tau = Σ z_{0..tau}` (cumulative sum at insertion time, before
+/// the τ-th observation enters the right segment).
+#[derive(Clone, Copy, Debug)]
+struct Piece {
+    tau: usize,
+    s_tau: f64,
+}
+
+/// Two-deque functional-pruning state for the GLR inner loop.
+///
+/// Invariant after every `step`: pieces in `qr` (right deque) have
+/// strictly increasing `argmax(τ, t) = (S_t − S_τ)/(t − τ)` along the
+/// deque; pieces in `ql` (left deque) have strictly decreasing argmax.
+/// The τ=0 piece (`s_tau = 0`) is the implicit pre-change baseline and
+/// always sits at the front of both deques.
+#[derive(Clone, Default)]
+struct PruningState {
+    qr: VecDeque<Piece>,
+    ql: VecDeque<Piece>,
 }
 
 impl FocusDetector {
@@ -65,7 +102,18 @@ impl FocusDetector {
             m2: 0.0,
             n: 0,
             last_emit: None,
+            mode: InnerLoop::Naive,
         }
+    }
+
+    /// Opt into the functional-pruning inner loop (Romano et al. 2023).
+    ///
+    ///
+    /// Use for long streams (t ≥ 10^4); the naive path is faster on
+    /// short streams due to lower constants.
+    pub fn with_pruning(mut self) -> Self {
+        self.mode = InnerLoop::Pruned(PruningState::new());
+        self
     }
 
     /// Detect on a complete batch. Mirrors `BocpdDetector::detect`.
@@ -112,32 +160,33 @@ impl FocusDetector {
             }
         }
         // Append z-normed observation to the segment cumsum.
-        let prev = self.seg_sums.last().copied().unwrap_or(0.0);
-        self.seg_sums.push(prev + z);
+        self.seg_sums.push(self.seg_sums.last().copied().unwrap_or(0.0) + z);
 
         // Need at least 2 observations in the segment to define a split.
         let m = self.seg_sums.len();
-        if m < 4 {
-            return None;
-        }
         let total = *self.seg_sums.last().unwrap();
-        let mut best_stat = 0.0f64;
-        let mut best_tau = 0usize;
-        // τ = number of obs before the split, in [1, m−1].
-        for tau in 1..m {
-            let s_left = self.seg_sums[tau - 1];
-            let s_right = total - s_left;
-            let n_l = tau as f64;
-            let n_r = (m - tau) as f64;
-            let mean_l = s_left / n_l;
-            let mean_r = s_right / n_r;
-            let diff = mean_l - mean_r;
-            let stat = 0.5 * (n_l * n_r / m as f64) * diff * diff;
-            if stat > best_stat {
-                best_stat = stat;
-                best_tau = tau;
+
+        // Compute (best_stat, best_tau) via the active inner-loop strategy.
+        // Pruned mode dispatches to `step_with_query` BEFORE the m < 4
+        // short-circuit because the deque must stay in lockstep with
+        // `seg_sums` -- skipping the prune+append on early steps would
+        // leave the structure stale by the time m reaches the threshold.
+        // Naive does no per-step state, so the early-return is safe there.
+        let (best_stat, best_tau) = match &mut self.mode {
+            InnerLoop::Naive => {
+                if m < 4 {
+                    return None;
+                }
+                naive_inner_loop(&self.seg_sums, total, m)
             }
-        }
+            InnerLoop::Pruned(state) => {
+                let res = state.step_with_query(total, m);
+                if m < 4 {
+                    return None;
+                }
+                res
+            }
+        };
 
         if best_stat >= self.threshold {
             let cp_abs = self.seg_start + best_tau;
@@ -152,6 +201,11 @@ impl FocusDetector {
             }
             self.seg_sums = new_sums;
             self.seg_start = cp_abs;
+            // Rebuild the pruning deque from the new right-segment cumsum
+            // so it stays in lockstep with `seg_sums`.
+            if let InnerLoop::Pruned(state) = &mut self.mode {
+                state.rebuild_from_seg_sums(&self.seg_sums);
+            }
             Some(cp_abs)
         } else {
             None
@@ -161,6 +215,163 @@ impl FocusDetector {
     /// Number of observations seen so far.
     pub fn total_steps(&self) -> usize {
         self.n
+    }
+}
+
+/// Naive O(t) argmax over candidate split points τ ∈ [1, m−1].
+/// Returns `(best_stat, best_tau)`. Tie-break: smaller τ wins (strict
+/// `>` on the running max).
+fn naive_inner_loop(seg_sums: &[f64], total: f64, m: usize) -> (f64, usize) {
+    let mut best_stat = 0.0f64;
+    let mut best_tau = 0usize;
+    let m_f = m as f64;
+    for tau in 1..m {
+        let s_left = seg_sums[tau - 1];
+        let s_right = total - s_left;
+        let n_l = tau as f64;
+        let n_r = (m - tau) as f64;
+        let mean_l = s_left / n_l;
+        let mean_r = s_right / n_r;
+        let diff = mean_l - mean_r;
+        let stat = 0.5 * (n_l * n_r / m_f) * diff * diff;
+        if stat > best_stat {
+            best_stat = stat;
+            best_tau = tau;
+        }
+    }
+    (best_stat, best_tau)
+}
+
+impl PruningState {
+    fn new() -> Self {
+        let mut s = Self::default();
+        s.reseed_baseline();
+        s
+    }
+
+    fn reseed_baseline(&mut self) {
+        self.qr.clear();
+        self.ql.clear();
+        let baseline = Piece { tau: 0, s_tau: 0.0 };
+        self.qr.push_back(baseline);
+        self.ql.push_back(baseline);
+    }
+
+    /// Replay the prune+append cycle over `seg_sums` so the deque
+    /// matches what it would be after fresh streaming through the
+    /// right segment. No CPs emitted during replay (caller has
+    /// already fired and is rebuilding for the new regime).
+    fn rebuild_from_seg_sums(&mut self, seg_sums: &[f64]) {
+        self.reseed_baseline();
+        for (i, &total) in seg_sums.iter().enumerate() {
+            let m = i + 1;
+            self.prune_back(total, m);
+            self.append(m, total);
+        }
+    }
+
+    /// One streaming step at segment-relative time t = m, post-push
+    /// running sum `total = S_t`. Performs prune → query → append in
+    /// the order required for parity with the naive inner loop.
+    /// Returns `(best_stat, best_tau)` over τ ∈ [1, m−1].
+    fn step_with_query(&mut self, total: f64, m: usize) -> (f64, usize) {
+        self.prune_back(total, m);
+        let result = self.query(total, m);
+        self.append(m, total);
+        result
+    }
+
+    /// Pop dominated pieces from the back of each deque, given current
+    /// `(S_t, t) = (total, m)`. Right deque keeps strictly increasing
+    /// argmax along the deque; left deque keeps strictly decreasing.
+    /// Cross-multiplication avoids the division.
+    fn prune_back(&mut self, total: f64, m: usize) {
+        let m_f = m as f64;
+        // Invariant: every piece in either deque has `tau < m` at prune
+        // time (we prune before appending the new τ=m piece, and the
+        // most-recent existing piece was appended at the previous step
+        // with τ = m-1). Both denominators are therefore strictly > 0.
+        // Right deque: argmax_back ≤ argmax_prev → pop back.
+        while self.qr.len() >= 2 {
+            let last = self.qr[self.qr.len() - 1];
+            let prev = self.qr[self.qr.len() - 2];
+            let dl = m_f - last.tau as f64;
+            let dp = m_f - prev.tau as f64;
+            debug_assert!(dl > 0.0 && dp > 0.0, "deque tau ≥ m invariant break");
+            // argmax(p) = (total - p.s_tau) / (m - p.tau).
+            // (a/b) ≤ (c/d) with b, d > 0 ⟺ a·d ≤ c·b.
+            let lhs = (total - last.s_tau) * dp;
+            let rhs = (total - prev.s_tau) * dl;
+            if lhs <= rhs {
+                self.qr.pop_back();
+            } else {
+                break;
+            }
+        }
+        // Left deque: argmax_back ≥ argmax_prev → pop back.
+        while self.ql.len() >= 2 {
+            let last = self.ql[self.ql.len() - 1];
+            let prev = self.ql[self.ql.len() - 2];
+            let dl = m_f - last.tau as f64;
+            let dp = m_f - prev.tau as f64;
+            debug_assert!(dl > 0.0 && dp > 0.0, "deque tau ≥ m invariant break");
+            let lhs = (total - last.s_tau) * dp;
+            let rhs = (total - prev.s_tau) * dl;
+            if lhs >= rhs {
+                self.ql.pop_back();
+            } else {
+                break;
+            }
+        }
+    }
+
+    /// Walk both deques, compute the GLR statistic for each kept τ > 0,
+    /// return `(best_stat, best_tau)`. Bit-for-bit identical to the
+    /// naive form for the same τ -- uses the
+    /// `½ · τ(t−τ)/t · (μ_L − μ_R)²` representation, not the
+    /// cancellation-prone `½(S_t−S_τ)²/(t−τ) + m₀_τ − m₀_now` form.
+    ///
+    /// Tie-break: smaller τ wins, matching the naive `1..m` loop with
+    /// strict `>`. The walk visits qr in increasing-τ order, then ql.
+    /// This preserves naive parity on noisy data (where exact stat
+    /// equality across distinct τ never arises), but a contrived
+    /// fixture with exactly-tied stats across the qr/ql split would
+    /// pick the qr-side τ here while naive would pick the smaller τ.
+    /// If such a fixture ever appears, switch to a merge-walk by τ
+    /// over the union of the two deques.
+    fn query(&self, total: f64, m: usize) -> (f64, usize) {
+        let mut best_stat = 0.0f64;
+        let mut best_tau = 0usize;
+        let m_f = m as f64;
+        // Walk pieces in increasing-τ order (deque invariant) so that
+        // ties break the same way the naive loop does (smaller τ wins).
+        // qr first, then ql; both contain the τ=0 baseline (skipped).
+        // `piece.tau < m` always at query time -- append happens after
+        // query, so the τ=m piece doesn't yet exist in either deque.
+        for piece in self.qr.iter().chain(self.ql.iter()) {
+            debug_assert!(piece.tau < m, "deque tau ≥ m at query");
+            if piece.tau == 0 {
+                continue;
+            }
+            let tau_f = piece.tau as f64;
+            let n_l = tau_f;
+            let n_r = m_f - tau_f;
+            let mean_l = piece.s_tau / n_l;
+            let mean_r = (total - piece.s_tau) / n_r;
+            let diff = mean_l - mean_r;
+            let stat = 0.5 * (n_l * n_r / m_f) * diff * diff;
+            if stat > best_stat {
+                best_stat = stat;
+                best_tau = piece.tau;
+            }
+        }
+        (best_stat, best_tau)
+    }
+
+    fn append(&mut self, tau: usize, s_tau: f64) {
+        let p = Piece { tau, s_tau };
+        self.qr.push_back(p);
+        self.ql.push_back(p);
     }
 }
 

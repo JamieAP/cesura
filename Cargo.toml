@@ -23,6 +23,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 changepoint = "0.15"
 rv = "0.19"
+criterion = "0.5"
 
 [[test]]
 name = "statistical"
@@ -59,3 +60,8 @@ required-features = ["test-utils", "joint-detection"]
 [[test]]
 name = "streaming_chen_wu"
 required-features = ["test-utils", "joint-detection"]
+
+[[bench]]
+name = "focus_pruning"
+harness = false
+required-features = ["test-utils"]
