@@ -20,6 +20,8 @@
 use crate::bocpd::BocpdDetector;
 use crate::detrend::{dominant_period_via_acf, seasonal_difference};
 use crate::focus::FocusDetector;
+use crate::nig::Nig;
+use crate::predictive::Predictive;
 use crate::ChangePoint;
 
 /// Ensemble detector: BOCPD with FOCuS confirmation.
@@ -29,31 +31,29 @@ use crate::ChangePoint;
 /// step-distance between a BOCPD index and a FOCuS index for the latter
 /// to count as confirmation.
 ///
-pub struct EnsembleDetector {
-    bocpd: BocpdDetector,
+pub struct EnsembleDetector<P: Predictive = Nig> {
+    bocpd: BocpdDetector<P>,
     focus_threshold: f64,
     confidence_floor: f64,
     tolerance: usize,
     auto_detrend: bool,
 }
 
-impl EnsembleDetector {
+impl EnsembleDetector<Nig> {
     /// Construct with BOCPD lambda + max run-length and the documented
-    /// ensemble defaults.
+    /// ensemble defaults. Uses the standard `Nig` prior; for non-default
+    /// predictives (e.g. `BocpdDetector::<NigAr1>::with_prior(...)`),
+    /// pass through [`EnsembleDetector::from_bocpd`].
     pub fn new(lambda: f64, max_run_length: usize) -> Self {
-        Self {
-            bocpd: BocpdDetector::new(lambda, max_run_length),
-            focus_threshold: 8.0,
-            confidence_floor: 0.40,
-            tolerance: 25,
-            auto_detrend: false,
-        }
+        Self::from_bocpd(BocpdDetector::new(lambda, max_run_length))
     }
+}
 
-    /// Construct from an existing [`BocpdDetector`] -- preserves any
+impl<P: Predictive> EnsembleDetector<P> {
+    /// Construct from an existing [`BocpdDetector<P>`] -- preserves any
     /// builder customisation (mass cutoff, β-divergence, prior) the
-    /// caller has already applied.
-    pub fn from_bocpd(bocpd: BocpdDetector) -> Self {
+    /// caller has already applied. Generic over the predictive `P`.
+    pub fn from_bocpd(bocpd: BocpdDetector<P>) -> Self {
         Self {
             bocpd,
             focus_threshold: 8.0,

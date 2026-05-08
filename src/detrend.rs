@@ -268,10 +268,10 @@ pub fn seasonal_difference(data: &[f64], period: usize) -> Vec<f64> {
 /// When auto-detection returns no period, the guard short-circuits to
 /// the raw-detector output (no false positives are filtered, but no
 /// real detections are lost either).
-pub fn detect_with_seasonal_guard(
+pub fn detect_with_seasonal_guard<P: crate::Predictive>(
     data: &[f64],
     period: Option<usize>,
-    detector: &crate::BocpdDetector,
+    detector: &crate::BocpdDetector<P>,
 ) -> Vec<crate::ChangePoint> {
     let raw_cps = detector.detect(data);
 

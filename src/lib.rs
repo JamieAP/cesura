@@ -32,7 +32,9 @@ pub mod ensemble;
 #[cfg(any(test, feature = "test-utils"))]
 pub mod eval;
 pub mod focus;
+pub mod nig_ar1;
 pub mod niw;
+pub mod predictive;
 pub mod streaming;
 #[cfg(feature = "joint-detection")]
 pub mod streaming_chen_wu;
@@ -43,8 +45,10 @@ mod nig;
 
 pub use bocpd::BocpdDetector;
 pub use ensemble::EnsembleDetector;
+pub use nig::Nig;
+pub use nig_ar1::NigAr1;
+pub use predictive::Predictive;
 pub(crate) use math::{lgamma, log_add_exp};
-pub(crate) use nig::Nig;
 
 /// A detected change point with its index and confidence score.
 #[derive(Debug, Clone)]

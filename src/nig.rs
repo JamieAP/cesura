@@ -1,12 +1,22 @@
 //! Normal-Inverse-Gamma conjugate prior for the BOCPD recursion.
+//!
+//! Implements the iid-Gaussian within-regime predictive used by
+//! `BocpdDetector::<Nig>` (the default). This public module allows
+//! external callers to spell `BocpdDetector<Nig>` and supplies its
+//! `Predictive` implementation.
 
 use std::f64::consts::PI;
 
 use crate::math::student_t_lpdf;
+use crate::predictive::Predictive;
 
-/// Normal-Inverse-Gamma sufficient statistics.
+/// Normal-Inverse-Gamma sufficient statistics. Conjugate prior for the
+/// iid-Gaussian within-regime model used by [`crate::BocpdDetector`].
+///
+/// The struct is `pub` (so `BocpdDetector<Nig>` resolves outside the
+/// crate); fields stay `pub(crate)` -- construct via [`Nig::new`].
 #[derive(Clone)]
-pub(crate) struct Nig {
+pub struct Nig {
     pub(crate) mu: f64,
     pub(crate) kappa: f64,
     pub(crate) alpha: f64,
@@ -14,8 +24,9 @@ pub(crate) struct Nig {
 }
 
 impl Nig {
-    #[cfg_attr(not(feature = "joint-detection"), allow(dead_code))]
-    pub(crate) fn new(mu: f64, kappa: f64, alpha: f64, beta: f64) -> Self {
+    /// Construct sufficient statistics with `(μ, κ, α, β)`. The default
+    /// prior used by `BocpdDetector::new(...)` is `Nig::new(0, 1, 1, 1)`.
+    pub fn new(mu: f64, kappa: f64, alpha: f64, beta: f64) -> Self {
         Self {
             mu,
             kappa,
@@ -83,6 +94,20 @@ impl Nig {
         let int_log = -0.5 * beta * (2.0 * PI * var).ln() - 0.5 * (beta + 1.0).ln();
         let int_term = int_log.exp();
         f_pow_beta / beta - int_term / (beta + 1.0)
+    }
+}
+
+impl Predictive for Nig {
+    fn update(&self, x: f64) -> Self {
+        Nig::update(self, x)
+    }
+
+    fn log_predictive(&self, x: f64) -> f64 {
+        Nig::log_predictive(self, x)
+    }
+
+    fn log_predictive_robust(&self, x: f64, beta: f64) -> f64 {
+        Nig::log_predictive_robust(self, x, beta)
     }
 }
 

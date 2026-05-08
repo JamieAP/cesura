@@ -3,6 +3,7 @@
 use crate::math::log_add_exp;
 use crate::niw;
 use crate::nig::Nig;
+use crate::predictive::Predictive;
 use crate::ChangePoint;
 use crate::DEFAULT_MASS_CUTOFF;
 
@@ -105,11 +106,20 @@ fn per_dim_znorm(data: &[Vec<f64>], d: usize, n: usize) -> Vec<Vec<f64>> {
 
 /// Bayesian Online Change Point Detector.
 ///
-/// Uses the BOCPD algorithm with a Normal-Inverse-Gamma conjugate prior
-/// and MAP run-length estimation for change point detection.
-pub struct BocpdDetector {
-    hazard_log: f64,
-    growth_log: f64,
+/// Uses the BOCPD algorithm (Adams & MacKay 2007) with a conjugate
+/// within-regime predictive `P` and MAP run-length estimation. Default
+/// `P = Nig` -- iid-Gaussian with Normal-Inverse-Gamma prior. The
+/// recursion is generic over [`Predictive`]; call sites resolve
+/// `<P = Nig>` via the default type parameter.
+///
+/// To use a non-default predictive (e.g. `NigAr1` for AR(1) within-regime),
+/// build via [`BocpdDetector::with_prior`] which is generic over `P`.
+pub struct BocpdDetector<P: Predictive = Nig> {
+    /// Expected run length between change points; mutable when
+    /// adaptive λ is enabled, fixed otherwise. The hazard rate
+    /// `1/lambda` and growth rate `1 - 1/lambda` are derived locally
+    /// inside detect functions.
+    lambda: f64,
     max_rl: usize,
     log_mass_cutoff: f64,
     /// β-divergence robustness parameter. `0.0` ⇒ standard BOCPD (default,
@@ -117,10 +127,17 @@ pub struct BocpdDetector {
     /// `β > 0` ⇒ Knoblauch et al. (2018) robust update for heavy-tailed
     /// within-regime distributions.
     beta: f64,
-    prior: Nig,
+    prior: P,
+    /// When true, [`BocpdDetector::detect_mut`] updates `lambda` from
+    /// observed inter-CP intervals via an EMA (decay 0.9). Default off;
+    /// `detect()` is unaffected regardless.
+    adaptive_lambda: bool,
+    /// EMA of observed inter-CP intervals. `None` until the first
+    /// interval is seen; thereafter holds the running mean.
+    interval_ema: Option<f64>,
 }
 
-impl BocpdDetector {
+impl BocpdDetector<Nig> {
     /// Create a detector with expected run length `lambda` between change points.
     ///
     /// - `lambda`: expected number of observations between change points.
@@ -130,24 +147,59 @@ impl BocpdDetector {
     ///   the binding constraint -- the tail prunes itself well before the
     ///   cap. Set generously (≥ data.len() for batch).
     ///
+    /// Uses the standard Nig prior `(μ=0, κ=1, α=1, β=1)`. To use a custom
+    /// prior or a different predictive family (e.g. AR(1)), use
+    /// [`BocpdDetector::with_prior`].
+    ///
     /// # Panics
     /// Panics if `lambda <= 1.0` (would produce -inf or NaN hazard rates).
     pub fn new(lambda: f64, max_run_length: usize) -> Self {
+        Self::with_prior(lambda, max_run_length, Nig::new(0.0, 1.0, 1.0, 1.0))
+    }
+}
+
+impl<P: Predictive> BocpdDetector<P> {
+    /// Create a detector with expected run length `lambda` and an explicit
+    /// `prior`. The generic constructor; `BocpdDetector::new` is the
+    /// `P = Nig` shortcut with a hardcoded prior.
+    ///
+    /// # Panics
+    /// Panics if `lambda <= 1.0`.
+    pub fn with_prior(lambda: f64, max_run_length: usize, prior: P) -> Self {
         assert!(lambda > 1.0, "lambda must be > 1.0, got {lambda}");
-        let h = 1.0 / lambda;
         Self {
-            hazard_log: h.ln(),
-            growth_log: (1.0 - h).ln(),
+            lambda,
             max_rl: max_run_length,
             log_mass_cutoff: DEFAULT_MASS_CUTOFF.ln(),
             beta: 0.0,
-            prior: Nig {
-                mu: 0.0,
-                kappa: 1.0,
-                alpha: 1.0,
-                beta: 1.0,
-            },
+            prior,
+            adaptive_lambda: false,
+            interval_ema: None,
         }
+    }
+
+    /// Opt into adaptive λ. After each call to
+    /// [`BocpdDetector::detect_mut`], `lambda` is updated via an EMA
+    /// (decay 0.9) over inter-CP intervals observed in the most-recent
+    /// call. `detect()` (immutable) remains unaffected; existing batch
+    /// callers see no change.
+    pub fn with_adaptive_lambda(mut self) -> Self {
+        self.adaptive_lambda = true;
+        self
+    }
+
+    /// Current expected run length λ. Useful for assertions in tests
+    /// of the adaptive-λ path; otherwise rarely needed.
+    pub fn lambda(&self) -> f64 {
+        self.lambda
+    }
+
+    fn hazard_log(&self) -> f64 {
+        (1.0 / self.lambda).ln()
+    }
+
+    fn growth_log(&self) -> f64 {
+        (1.0 - 1.0 / self.lambda).ln()
     }
 
     /// Opt into β-divergence robust BOCPD (Knoblauch et al. 2018,
@@ -198,6 +250,42 @@ impl BocpdDetector {
             f64::NEG_INFINITY
         };
         self
+    }
+
+    /// Mutating variant of [`detect`](Self::detect). Identical detection
+    /// semantics; additionally, when `with_adaptive_lambda` is enabled,
+    /// updates `self.lambda` after the call from inter-CP intervals
+    /// observed in the returned change-point sequence (EMA, decay 0.9).
+    /// Subsequent calls use the updated `λ`.
+    ///
+    /// `detect()` (immutable) remains unchanged regardless of the
+    /// adaptive flag, so existing batch callers see no behaviour shift.
+    pub fn detect_mut(&mut self, data: &[f64]) -> Vec<ChangePoint> {
+        let cps = self.detect(data);
+        if self.adaptive_lambda && cps.len() >= 2 {
+            // EMA over inter-CP intervals. decay = 0.9 ⇒ α = 0.1; the
+            // first observed interval seeds the EMA.
+            const ALPHA: f64 = 0.1;
+            for w in cps.windows(2) {
+                let interval = (w[1].index - w[0].index) as f64;
+                if !interval.is_finite() || interval <= 0.0 {
+                    continue;
+                }
+                self.interval_ema = Some(match self.interval_ema {
+                    Some(prev) => ALPHA * interval + (1.0 - ALPHA) * prev,
+                    None => interval,
+                });
+            }
+            if let Some(ema) = self.interval_ema {
+                // Guard: λ > 1 is required (constructor invariant). If
+                // the EMA collapses below 1 we leave λ alone -- the
+                // detector hasn't observed enough structure yet.
+                if ema > 1.0 && ema.is_finite() {
+                    self.lambda = ema;
+                }
+            }
+        }
+        cps
     }
 
     /// Run BOCPD on `data`, return all change points that pass the
@@ -260,6 +348,8 @@ impl BocpdDetector {
         // call it and let it pick.
         let beta = self.beta;
         let prior_pred_at = |x: f64| self.prior.log_predictive_robust(x, beta);
+        let hazard_log = self.hazard_log();
+        let growth_log = self.growth_log();
 
         for (t, &x) in norm.iter().enumerate() {
             let active = (t + 1).min(max_r);
@@ -279,7 +369,7 @@ impl BocpdDetector {
                 // Growth: r -> r+1 uses posterior predictive given r history.
                 if r < max_r {
                     new_rl[r + 1] =
-                        log_add_exp(new_rl[r + 1], rl_log[r] + pred + self.growth_log);
+                        log_add_exp(new_rl[r + 1], rl_log[r] + pred + growth_log);
                 }
                 // Accumulate prior-segment mass for the CP branch.
                 prev_mass = log_add_exp(prev_mass, rl_log[r]);
@@ -290,7 +380,7 @@ impl BocpdDetector {
             // near the hazard rate even at real CPs.
             let prior_pred = prior_pred_at(x);
             new_rl[0] = if prior_pred.is_finite() && prev_mass.is_finite() {
-                prev_mass + self.hazard_log + prior_pred
+                prev_mass + hazard_log + prior_pred
             } else {
                 f64::NEG_INFINITY
             };
@@ -457,6 +547,8 @@ impl BocpdDetector {
         rl_log[0] = 0.0;
         let mut stats = vec![self.prior.clone(); max_r + 1];
         let beta = self.beta;
+        let hazard_log = self.hazard_log();
+        let growth_log = self.growth_log();
         let mut cp_probs = Vec::with_capacity(n);
         for &x in &norm {
             let active = (n).min(max_r);
@@ -471,13 +563,13 @@ impl BocpdDetector {
                     continue;
                 }
                 if r < max_r {
-                    new_rl[r + 1] = log_add_exp(new_rl[r + 1], rl_log[r] + pred + self.growth_log);
+                    new_rl[r + 1] = log_add_exp(new_rl[r + 1], rl_log[r] + pred + growth_log);
                 }
                 prev_mass = log_add_exp(prev_mass, rl_log[r]);
             }
             let prior_pred = self.prior.log_predictive_robust(x, beta);
             new_rl[0] = if prior_pred.is_finite() && prev_mass.is_finite() {
-                prev_mass + self.hazard_log + prior_pred
+                prev_mass + hazard_log + prior_pred
             } else {
                 f64::NEG_INFINITY
             };
@@ -551,6 +643,8 @@ impl BocpdDetector {
         let max_r = self.max_rl.min(n);
         let beta = self.beta;
         let prior_pred_at = |x: f64| self.prior.log_predictive_robust(x, beta);
+        let hazard_log = self.hazard_log();
+        let growth_log = self.growth_log();
 
         // V[r] = max log P(r_t = r, x_{1:t}, best path to here). Stored
         // un-normalised (max-plus, no log_sum_exp normalisation step --
@@ -586,7 +680,7 @@ impl BocpdDetector {
                 if !v.is_finite() {
                     continue;
                 }
-                let candidate = v + self.hazard_log;
+                let candidate = v + hazard_log;
                 if candidate > best_pred {
                     best_pred = candidate;
                     best_pred_r = r;
@@ -610,7 +704,7 @@ impl BocpdDetector {
                     continue;
                 }
                 if r < max_r {
-                    let candidate = v_log[r] + pred + self.growth_log;
+                    let candidate = v_log[r] + pred + growth_log;
                     if candidate > new_v[r + 1] {
                         new_v[r + 1] = candidate;
                     }
@@ -694,6 +788,12 @@ impl BocpdDetector {
     /// All observations must have the same dimensionality.
     ///
     /// Returns change points using the same MAP run-length drop detection as univariate.
+    ///
+    /// **Note: this method ignores the type parameter `P` and always
+    /// uses an internal Normal-Inverse-Wishart (NIW) predictive.**
+    /// It is defined on `BocpdDetector<P>` for symmetry with `detect`,
+    /// but a `BocpdDetector::<NigAr1>` will run iid-NIW multivariately,
+    /// not AR(1) multivariately. Multivariate AR(p) is not implemented.
     pub fn detect_multivariate(&self, data: &[Vec<f64>]) -> Vec<ChangePoint> {
         let n = data.len();
         if n < 20 {
@@ -745,6 +845,8 @@ impl BocpdDetector {
         let mut stats = vec![prior.clone(); max_r + 1];
         let mut map_rls = Vec::with_capacity(n);
         let mut cp_probs = Vec::with_capacity(n);
+        let hazard_log = self.hazard_log();
+        let growth_log = self.growth_log();
 
         for (t, x) in norm.iter().enumerate() {
             let active = (t + 1).min(max_r);
@@ -761,13 +863,13 @@ impl BocpdDetector {
                 }
                 if r < max_r {
                     new_rl[r + 1] =
-                        log_add_exp(new_rl[r + 1], rl_log[r] + pred + self.growth_log);
+                        log_add_exp(new_rl[r + 1], rl_log[r] + pred + growth_log);
                 }
                 prev_mass = log_add_exp(prev_mass, rl_log[r]);
             }
             let prior_pred = prior.log_predictive(x);
             new_rl[0] = if prior_pred.is_finite() && prev_mass.is_finite() {
-                prev_mass + self.hazard_log + prior_pred
+                prev_mass + hazard_log + prior_pred
             } else {
                 f64::NEG_INFINITY
             };
