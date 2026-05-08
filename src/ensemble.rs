@@ -18,7 +18,7 @@
 //!
 
 use crate::bocpd::BocpdDetector;
-use crate::conformal::ScoredDetect;
+use crate::conformal::{MvScoredDetect, ScoredDetect};
 use crate::detrend::{dominant_period_via_acf, seasonal_difference};
 use crate::focus::FocusDetector;
 use crate::nig::Nig;
@@ -102,6 +102,41 @@ impl<P: Predictive> EnsembleDetector<P> {
     /// difference `y_t - y_{t-period}` before the recursion runs;
     /// emitted indices are shifted back into the original sample
     /// space. Aperiodic streams skip this step automatically.
+    /// Multivariate ensemble: `BocpdDetector::detect_multivariate`
+    /// (NIW + Mahalanobis whitening) confirmed by
+    /// `FocusDetector::detect_multivariate` (per-dim FOCuS OR-union).
+    /// Same `confidence_or_confirmed` rule as the univariate path.
+    ///
+    /// **Asymmetric arms.** BOCPD MV is the load-bearing detector --
+    /// it catches the anti-correlated-shift case the per-dim FOCuS
+    /// path misses (see `tests/correctness.rs::multivariate_detects_correlated_shift_per_dim_invisible`
+    /// and the per-dim-OR-misses pin in `src/focus.rs::tests::mv_focus_per_dim_union_misses_anti_correlated_at_low_shift`).
+    /// FOCuS-MV serves only as a CONFIRMATION filter, suppressing
+    /// low-confidence BOCPD calls that no per-dim FOCuS supports. On
+    /// shifts that BOCPD alone catches but per-dim FOCuS misses, the
+    /// confidence-floor branch still passes them through.
+    ///
+    /// `auto_detrend` is **not** applied here -- `seasonal_difference`
+    /// and `dominant_period_via_acf` are univariate-only. Multivariate
+    /// inputs ignore the flag silently.
+    pub fn detect_multivariate(&self, data: &[Vec<f64>]) -> Vec<ChangePoint> {
+        let bocpd_cps = self.bocpd.detect_multivariate(data);
+        let focus_cps = FocusDetector::new(self.focus_threshold)
+            .detect_multivariate(data);
+        let tol = self.tolerance as i64;
+        bocpd_cps
+            .into_iter()
+            .filter(|cp| {
+                if cp.confidence >= self.confidence_floor {
+                    return true;
+                }
+                focus_cps
+                    .iter()
+                    .any(|f| (f.index as i64 - cp.index as i64).abs() <= tol)
+            })
+            .collect()
+    }
+
     pub fn detect(&self, data: &[f64]) -> Vec<ChangePoint> {
         let (working_data, shift): (std::borrow::Cow<'_, [f64]>, usize) = if self.auto_detrend {
             match dominant_period_via_acf(data) {
@@ -181,6 +216,35 @@ impl<P: Predictive> ScoredDetect for EnsembleDetector<P> {
     }
 }
 
+impl<P: Predictive> MvScoredDetect for EnsembleDetector<P> {
+    /// Multivariate analogue of the `ScoredDetect` impl. Forwards
+    /// BOCPD's per-CP score through the FOCuS-MV-confirmation filter.
+    /// Score units follow `BocpdDetector::detect_multivariate_with_score`
+    /// (trigger-to-MAP-CP-mass-peak offset, computed on the run-length
+    /// posterior which is 1-D regardless of input dim). `auto_detrend`
+    /// is ignored on MV input -- same as `detect_multivariate`.
+    fn detect_multivariate_with_score(
+        &self,
+        data: &[Vec<f64>],
+    ) -> Vec<(ChangePoint, f64)> {
+        let bocpd_scored = self.bocpd.detect_multivariate_with_score(data);
+        let focus_cps = FocusDetector::new(self.focus_threshold)
+            .detect_multivariate(data);
+        let tol = self.tolerance as i64;
+        bocpd_scored
+            .into_iter()
+            .filter(|(cp, _)| {
+                if cp.confidence >= self.confidence_floor {
+                    return true;
+                }
+                focus_cps
+                    .iter()
+                    .any(|f| (f.index as i64 - cp.index as i64).abs() <= tol)
+            })
+            .collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -222,5 +286,77 @@ mod tests {
         let det = EnsembleDetector::new(200.0, 50);
         let cps = det.detect(&[0.0; 5]);
         assert!(cps.is_empty());
+    }
+
+    // ── MV ensemble ─────────────────────────────────────────────
+
+    #[test]
+    fn mv_ensemble_clean_axis_aligned_shift() {
+        // Both dims shift +5σ at t=100. BOCPD MV catches (high
+        // confidence); per-dim FOCuS confirms. Either arm alone would
+        // pass.
+        let mut data: Vec<Vec<f64>> = (0..100)
+            .map(|_| vec![0.0_f64, 0.0])
+            .collect();
+        data.extend((0..100).map(|_| vec![5.0_f64, 5.0]));
+        let det = EnsembleDetector::new(200.0, 250);
+        let cps = det.detect_multivariate(&data);
+        assert!(!cps.is_empty(), "expected MV ensemble to fire on axis-aligned 5σ shift");
+        assert!(
+            cps.iter().any(|c| (c.index as i64 - 100).abs() < 25),
+            "expected a CP near 100, got {:?}",
+            cps.iter().map(|c| c.index).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn mv_ensemble_anti_correlated_passes_via_high_confidence() {
+        // ρ=0.95, 1σ anti-correlated shift at t=200. Mahalanobis BOCPD
+        // catches with high confidence (per `where_cesura_shines §1`);
+        // per-dim FOCuS misses. The ensemble should still emit because
+        // BOCPD's confidence ≥ floor=0.40. This is the load-bearing
+        // claim: MV ensemble doesn't degrade BOCPD MV's anti-
+        // correlated-shift performance just because FOCuS-MV is weak.
+        use crate::eval::Rng;
+        let rho = 0.95_f64;
+        let mut rng = Rng::new(0xE001);
+        let mut data: Vec<Vec<f64>> = Vec::with_capacity(400);
+        for _ in 0..200 {
+            let z0 = rng.normal(0.0, 1.0);
+            let z1 = rng.normal(0.0, 1.0);
+            data.push(vec![z0, rho * z0 + (1.0 - rho * rho).sqrt() * z1]);
+        }
+        for _ in 0..200 {
+            let z0 = rng.normal(0.0, 1.0);
+            let z1 = rng.normal(0.0, 1.0);
+            data.push(vec![z0 + 0.5, rho * z0 + (1.0 - rho * rho).sqrt() * z1 - 0.5]);
+        }
+        let det = EnsembleDetector::new(200.0, 350);
+        let cps = det.detect_multivariate(&data);
+        assert!(
+            cps.iter().any(|c| (c.index as i64 - 200).abs() < 50),
+            "MV ensemble should inherit BOCPD's anti-correlated catch via confidence-floor branch; got {:?}",
+            cps.iter().map(|c| c.index).collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
+    fn mv_ensemble_empty_input_no_panic() {
+        let det = EnsembleDetector::new(200.0, 50);
+        let cps = det.detect_multivariate(&[]);
+        assert!(cps.is_empty());
+    }
+
+    #[test]
+    fn mv_ensemble_scored_emits_pairs_for_high_conf_cps() {
+        let mut data: Vec<Vec<f64>> = (0..100)
+            .map(|_| vec![0.0_f64, 0.0])
+            .collect();
+        data.extend((0..100).map(|_| vec![5.0_f64, 5.0]));
+        let det = EnsembleDetector::new(200.0, 250);
+        let scored = det.detect_multivariate_with_score(&data);
+        assert!(!scored.is_empty());
+        // Score must be finite and ≥ 0 (it's a step-offset).
+        assert!(scored.iter().all(|(_, s)| s.is_finite() && *s >= 0.0));
     }
 }

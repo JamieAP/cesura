@@ -1,6 +1,6 @@
 //! Bayesian Online Change Point detector (univariate + multivariate).
 
-use crate::conformal::ScoredDetect;
+use crate::conformal::{MvScoredDetect, ScoredDetect};
 use crate::math::log_add_exp;
 use crate::niw;
 use crate::nig::Nig;
@@ -1168,11 +1168,214 @@ impl<P: Predictive> BocpdDetector<P> {
         }
         result
     }
+
+    /// Multivariate analogue of [`detect_with_score`]. Returns
+    /// `(ChangePoint, f64)` pairs where the score is the same
+    /// **trigger-to-CP-mass-peak offset** as the univariate path:
+    /// `i − argmax_{k ∈ lookback} P(r_k = 0 | y_{1:k})`.
+    ///
+    /// The score computation is dimension-agnostic -- BOCPD's run-
+    /// length posterior is 1-D regardless of input dimension, so the
+    /// conformal exchangeability assumption transfers from the
+    /// univariate path unchanged. This is what
+    /// [`crate::ConformalCpWrapper::detect_multivariate`] consumes.
+    pub(crate) fn detect_multivariate_with_score(
+        &self,
+        data: &[Vec<f64>],
+    ) -> Vec<(ChangePoint, f64)> {
+        let n = data.len();
+        if n < 20 {
+            return vec![];
+        }
+        let d = data[0].len();
+        if d == 0 {
+            return vec![];
+        }
+        if data.iter().any(|row| row.len() != d) {
+            return vec![];
+        }
+
+        let warmup_n = (n / 3).min(60).max(d * 2);
+        let norm: Vec<Vec<f64>> = if warmup_n >= d * 2 && warmup_n <= n {
+            match whitening_transform(&data[..warmup_n], d) {
+                Some((mean, l_inv)) => data
+                    .iter()
+                    .map(|x| {
+                        let centered: Vec<f64> =
+                            (0..d).map(|i| x[i] - mean[i]).collect();
+                        forward_solve(&l_inv, &centered)
+                    })
+                    .collect(),
+                None => per_dim_znorm(data, d, n),
+            }
+        } else {
+            per_dim_znorm(data, d, n)
+        };
+
+        let max_r = self.max_rl.min(n);
+        let prior = niw::Niw::new(d);
+        let mut rl_log = vec![f64::NEG_INFINITY; max_r + 1];
+        rl_log[0] = 0.0;
+        let mut stats = vec![prior.clone(); max_r + 1];
+        let mut map_rls = Vec::with_capacity(n);
+        let mut cp_probs = Vec::with_capacity(n);
+        let hazard_log = self.hazard_log();
+        let growth_log = self.growth_log();
+
+        for (t, x) in norm.iter().enumerate() {
+            let active = (t + 1).min(max_r);
+            let mut new_rl = vec![f64::NEG_INFINITY; max_r + 1];
+            let mut prev_mass = f64::NEG_INFINITY;
+            for r in 0..=active.min(max_r.saturating_sub(1)) {
+                if rl_log[r] == f64::NEG_INFINITY {
+                    continue;
+                }
+                let pred = stats[r].log_predictive(x);
+                if !pred.is_finite() {
+                    continue;
+                }
+                if r < max_r {
+                    new_rl[r + 1] =
+                        log_add_exp(new_rl[r + 1], rl_log[r] + pred + growth_log);
+                }
+                prev_mass = log_add_exp(prev_mass, rl_log[r]);
+            }
+            let prior_pred = prior.log_predictive(x);
+            new_rl[0] = if prior_pred.is_finite() && prev_mass.is_finite() {
+                prev_mass + hazard_log + prior_pred
+            } else {
+                f64::NEG_INFINITY
+            };
+            let evidence = new_rl
+                .iter()
+                .copied()
+                .filter(|x| x.is_finite())
+                .fold(f64::NEG_INFINITY, log_add_exp);
+            if evidence.is_finite() {
+                for v in new_rl.iter_mut() {
+                    *v -= evidence;
+                }
+            }
+            if self.log_mass_cutoff > f64::NEG_INFINITY {
+                for r in (1..=max_r).rev() {
+                    if new_rl[r] >= self.log_mass_cutoff {
+                        break;
+                    }
+                    new_rl[r] = f64::NEG_INFINITY;
+                }
+            }
+            let map_r = new_rl
+                .iter()
+                .enumerate()
+                .filter(|(_, v)| v.is_finite())
+                .max_by(|a, b| a.1.total_cmp(b.1))
+                .map(|(r, _)| r)
+                .unwrap_or(0);
+            map_rls.push(map_r);
+            cp_probs.push(if new_rl[0].is_finite() {
+                new_rl[0].exp()
+            } else {
+                0.0
+            });
+            let mut new_stats = vec![prior.clone(); max_r + 1];
+            for r in 0..=active.min(max_r.saturating_sub(1)) {
+                if r < max_r && new_rl[r + 1] > f64::NEG_INFINITY {
+                    new_stats[r + 1] = stats[r].update(x);
+                }
+            }
+            rl_log = new_rl;
+            stats = new_stats;
+        }
+
+        // MAP-drop detection + score capture (mirrors detect_with_score).
+        let drop_to = 3;
+        let min_prev_rl = 30;
+        let cooldown = 15;
+
+        let mut result: Vec<(ChangePoint, f64)> = Vec::new();
+        let mut i = min_prev_rl;
+        let mut last_detection = 0usize;
+        while i < n {
+            if map_rls[i] <= drop_to && i - last_detection >= cooldown {
+                let prev_max = map_rls[i.saturating_sub(15)..i]
+                    .iter()
+                    .copied()
+                    .max()
+                    .unwrap_or(0);
+                if prev_max >= min_prev_rl {
+                    let look_back = cooldown.min(i);
+                    let confidence = cp_probs[i.saturating_sub(look_back)..=i]
+                        .iter()
+                        .copied()
+                        .fold(0.0_f64, f64::max)
+                        .clamp(0.0, 1.0);
+                    let w = 20;
+                    let before = &norm[i.saturating_sub(w)..i];
+                    let after = &norm[i..(i + w).min(n)];
+                    let shift_sigma = if before.is_empty() || after.is_empty() {
+                        0.0
+                    } else {
+                        let mut sum_sq = 0.0;
+                        for dim in 0..d {
+                            let mean_b = before.iter().map(|x| x[dim]).sum::<f64>()
+                                / before.len() as f64;
+                            let mean_a = after.iter().map(|x| x[dim]).sum::<f64>()
+                                / after.len() as f64;
+                            sum_sq += (mean_a - mean_b).powi(2);
+                        }
+                        sum_sq.sqrt()
+                    };
+                    if shift_sigma < 1e-9 {
+                        i += 1;
+                        continue;
+                    }
+                    let window_start = i - look_back;
+                    let mut peak_idx = i;
+                    let mut peak_val = cp_probs[i];
+                    for (k, &p) in cp_probs
+                        .iter()
+                        .enumerate()
+                        .take(i + 1)
+                        .skip(window_start)
+                    {
+                        if p > peak_val {
+                            peak_val = p;
+                            peak_idx = k;
+                        }
+                    }
+                    let score = (i - peak_idx) as f64;
+
+                    last_detection = i;
+                    result.push((
+                        ChangePoint {
+                            index: i,
+                            confidence,
+                            shift_sigma,
+                        },
+                        score,
+                    ));
+                    i += cooldown;
+                    continue;
+                }
+            }
+            i += 1;
+        }
+        result
+    }
 }
 
 impl<P: Predictive> ScoredDetect for BocpdDetector<P> {
     fn detect_with_score(&self, data: &[f64]) -> Vec<(ChangePoint, f64)> {
         BocpdDetector::detect_with_score(self, data)
+    }
+}
+
+impl<P: Predictive> MvScoredDetect for BocpdDetector<P> {
+    fn detect_multivariate_with_score(
+        &self,
+        data: &[Vec<f64>],
+    ) -> Vec<(ChangePoint, f64)> {
+        BocpdDetector::detect_multivariate_with_score(self, data)
     }
 }
 

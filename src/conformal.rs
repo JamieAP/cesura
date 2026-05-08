@@ -56,6 +56,24 @@ pub trait ScoredDetect {
     fn detect_with_score(&self, data: &[f64]) -> Vec<(ChangePoint, f64)>;
 }
 
+/// Multivariate analogue of [`ScoredDetect`]. Wraps a detector that
+/// consumes `&[Vec<f64>]` (rows = observations, columns = dimensions)
+/// and emits the same `(ChangePoint, score)` pair shape.
+///
+/// Scores must remain comparable across CPs from the same detector
+/// instance, the same way univariate scores do. The conformal
+/// exchangeability assumption is on the score sequence and is
+/// dimension-agnostic -- BOCPD's run-length posterior is 1-D
+/// regardless of input dimensionality, so the score's interpretation
+/// (the trigger-to-CP-mass-peak offset) carries over from the
+/// univariate path unchanged.
+pub trait MvScoredDetect {
+    fn detect_multivariate_with_score(
+        &self,
+        data: &[Vec<f64>],
+    ) -> Vec<(ChangePoint, f64)>;
+}
+
 /// Change point with a calibrated empirical timing interval.
 ///
 /// `timing_interval` is `(low, high)` in absolute-index space:
@@ -74,13 +92,13 @@ pub struct ConformalCp {
 /// Wrap a [`ScoredDetect`] with rolling-quantile timing intervals.
 ///
 /// Defaults: `coverage = 0.9`, `calibration_capacity = 500`.
-pub struct ConformalCpWrapper<D: ScoredDetect> {
+pub struct ConformalCpWrapper<D> {
     inner: D,
     calibration: RingBuffer,
     coverage: f64,
 }
 
-impl<D: ScoredDetect> ConformalCpWrapper<D> {
+impl<D> ConformalCpWrapper<D> {
     pub fn new(inner: D) -> Self {
         Self {
             inner,
@@ -118,8 +136,11 @@ impl<D: ScoredDetect> ConformalCpWrapper<D> {
     /// buffer is empty and yields the degenerate `(cp.index,
     /// cp.index)` interval; widths grow as the buffer fills and
     /// stabilise once it reaches capacity.
-    pub fn detect(&mut self, data: &[f64]) -> Vec<ConformalCp> {
-        let scored = self.inner.detect_with_score(data);
+    /// Shared post-detection conformal-quantile loop. Pulled out so
+    /// both `detect` (univariate, on `D: ScoredDetect`) and
+    /// `detect_multivariate` (on `D: MvScoredDetect`) share identical
+    /// calibration logic.
+    fn consume_scored(&mut self, scored: Vec<(ChangePoint, f64)>) -> Vec<ConformalCp> {
         let mut out = Vec::with_capacity(scored.len());
         for (cp, score) in scored {
             let (q_low, q_high) = self.calibration.quantile_interval(self.coverage);
@@ -135,6 +156,46 @@ impl<D: ScoredDetect> ConformalCpWrapper<D> {
             self.calibration.push(score);
         }
         out
+    }
+}
+
+impl<D: ScoredDetect> ConformalCpWrapper<D> {
+    /// Run the inner detector and emit calibrated timing intervals.
+    /// Online split-conformal-style: each emission's interval is
+    /// computed over the calibration buffer of **prior** scores; the
+    /// new score is pushed *after* the interval is queried, so it
+    /// never participates in its own bracket. The first emission's
+    /// buffer is empty and yields the degenerate `(cp.index,
+    /// cp.index)` interval; widths grow as the buffer fills and
+    /// stabilise once it reaches capacity.
+    pub fn detect(&mut self, data: &[f64]) -> Vec<ConformalCp> {
+        let scored = self.inner.detect_with_score(data);
+        self.consume_scored(scored)
+    }
+}
+
+/// Multivariate dispatch. Same wrapper struct, separate `impl` block
+/// so a detector that implements `MvScoredDetect` (but not `ScoredDetect`)
+/// can still be wrapped, and a detector that implements both -- like
+/// `BocpdDetector` -- gets `detect` and `detect_multivariate` on the
+/// same wrapper instance.
+///
+/// The calibration buffer is shared between the two paths: scores
+/// from univariate and multivariate emissions go into the same FIFO.
+/// In practice you'd run a `ConformalCpWrapper` on either univariate
+/// or multivariate data, not both -- the buffer-scope warning in the
+/// `ScoredDetect` doc applies here too: don't mix score conventions
+/// in one wrapper instance.
+impl<D: MvScoredDetect> ConformalCpWrapper<D> {
+    /// Run multivariate detection and emit calibrated timing intervals.
+    /// Same online split-conformal-style update as the univariate
+    /// `detect`: each emission's interval is computed over the
+    /// calibration buffer of *prior* scores; the new score is pushed
+    /// after the interval is queried, so it never participates in its
+    /// own bracket.
+    pub fn detect_multivariate(&mut self, data: &[Vec<f64>]) -> Vec<ConformalCp> {
+        let scored = self.inner.detect_multivariate_with_score(data);
+        self.consume_scored(scored)
     }
 }
 
@@ -282,6 +343,68 @@ mod tests {
             }
         }
         let _ = ConformalCpWrapper::new(Stub).with_coverage(1.0);
+    }
+
+    /// MV stub for the wrapper-impl-bound test. Confirms a detector
+    /// that ONLY implements `MvScoredDetect` (no `ScoredDetect`) can
+    /// still be wrapped and called via `detect_multivariate`.
+    struct MvStub {
+        emits: Vec<(usize, f64)>,
+    }
+
+    impl MvScoredDetect for MvStub {
+        fn detect_multivariate_with_score(
+            &self,
+            _data: &[Vec<f64>],
+        ) -> Vec<(ChangePoint, f64)> {
+            self.emits
+                .iter()
+                .map(|&(idx, score)| {
+                    (
+                        ChangePoint {
+                            index: idx,
+                            confidence: 0.5,
+                            shift_sigma: 1.0,
+                        },
+                        score,
+                    )
+                })
+                .collect()
+        }
+    }
+
+    #[test]
+    fn mv_wrapper_calibrates_intervals_from_prior_scores() {
+        let stub = MvStub {
+            emits: vec![(100, 0.0), (200, 1.0), (300, 2.0), (400, 3.0)],
+        };
+        let mut wrapper = ConformalCpWrapper::new(stub)
+            .with_coverage(0.9)
+            .with_calibration_capacity(10);
+        let dummy: Vec<Vec<f64>> = vec![vec![0.0]; 500];
+        let cps = wrapper.detect_multivariate(&dummy);
+        assert_eq!(cps.len(), 4);
+        // First emission: empty buffer → degenerate (cp.index, cp.index).
+        assert_eq!(cps[0].timing_interval, (100, 100));
+        // Subsequent emissions: non-degenerate intervals derived from
+        // prior scores; the new score is pushed AFTER the interval is
+        // queried so it never participates in its own bracket.
+        assert!(
+            cps[3].timing_interval.0 <= cps[3].timing_interval.1,
+            "interval lo {} should be ≤ hi {}",
+            cps[3].timing_interval.0,
+            cps[3].timing_interval.1
+        );
+    }
+
+    #[test]
+    fn mv_wrapper_compiles_without_scored_detect() {
+        // This is a compile-time check: MvStub does NOT implement
+        // ScoredDetect (no impl above), only MvScoredDetect. If the
+        // wrapper still required ScoredDetect, this wouldn't compile.
+        let stub = MvStub { emits: vec![] };
+        let wrapper = ConformalCpWrapper::new(stub).with_coverage(0.5);
+        let _ = wrapper; // suppress unused
     }
 
     #[test]

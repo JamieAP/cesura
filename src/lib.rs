@@ -45,7 +45,7 @@ mod math;
 mod nig;
 
 pub use bocpd::BocpdDetector;
-pub use conformal::{ConformalCp, ConformalCpWrapper, ScoredDetect};
+pub use conformal::{ConformalCp, ConformalCpWrapper, MvScoredDetect, ScoredDetect};
 pub use ensemble::EnsembleDetector;
 pub use nig::Nig;
 pub use nig_ar1::NigAr1;

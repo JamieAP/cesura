@@ -2253,3 +2253,70 @@ fn conformal_wrapper_coverage_under_snr_transition() {
         "marginal-across-regimes coverage {empirical:.3} outside [0.85, 0.99]"
     );
 }
+
+#[test]
+fn conformal_mv_wrapper_coverage_on_anticorrelated_shifts() {
+    // Multivariate analogue of `conformal_wrapper_coverage_is_nominal`.
+    // 200 alternating-regime pairs at ρ=0.95, 1σ anti-correlated shift
+    // (the exact fixture cesura's MV path is supposed to win on; per-
+    // dim z-norm misses these). Each regime is 100 bars; total 20k.
+    // Cap=50 calibration buffer; nominal coverage 0.90. Pin coverage
+    // ∈ [0.85, 0.99] -- same band as the univariate SNR-transition pin.
+    use cesura::{BocpdDetector, ConformalCpWrapper};
+    use cesura::MvScoredDetect;
+
+    let regime_len = 100usize;
+    let n_regimes = 200usize;
+    let rho = 0.95_f64;
+    let shift = 1.0_f64;
+    let mut rng = Rng::new(0xCAFE_F00D);
+    let mut data: Vec<Vec<f64>> = Vec::with_capacity(regime_len * n_regimes);
+    for r in 0..n_regimes {
+        let pos = r % 2 == 1;
+        for _ in 0..regime_len {
+            let z0 = rng.normal(0.0, 1.0);
+            let z1 = rng.normal(0.0, 1.0);
+            let off = if pos { shift * 0.5 } else { 0.0 };
+            let x0 = z0 + off;
+            let x1 = rho * z0 + (1.0 - rho * rho).sqrt() * z1 - off;
+            data.push(vec![x0, x1]);
+        }
+    }
+
+    let cap = 50usize;
+    let coverage = 0.9_f64;
+    let det = BocpdDetector::new(80.0, regime_len + 50);
+    let scored = det.detect_multivariate_with_score(&data);
+
+    let mut wrapper = ConformalCpWrapper::new(BocpdDetector::new(80.0, regime_len + 50))
+        .with_calibration_capacity(cap)
+        .with_coverage(coverage);
+    let conformal = wrapper.detect_multivariate(&data);
+    assert_eq!(conformal.len(), scored.len(), "1:1 emission parity");
+    assert!(scored.len() >= cap + 50, "need ≥ {} emissions, got {}", cap + 50, scored.len());
+
+    let post: Vec<(usize, &cesura::ConformalCp, f64)> = conformal
+        .iter()
+        .zip(scored.iter())
+        .enumerate()
+        .filter(|(idx, _)| *idx >= cap)
+        .map(|(idx, (c, (_, s)))| (idx, c, *s))
+        .collect();
+    let post_n = post.len();
+    let contained = post
+        .iter()
+        .filter(|(_, c, score)| {
+            let t_collapse = c.cp.index as i64 - score.round() as i64;
+            let (lo, hi) = c.timing_interval;
+            lo <= t_collapse && t_collapse <= hi
+        })
+        .count();
+    let empirical = contained as f64 / post_n as f64;
+    eprintln!(
+        "mv anticorrelated: post-warmup={post_n} empirical_coverage={empirical:.3} (nominal {coverage})"
+    );
+    assert!(
+        (0.85..=0.99).contains(&empirical),
+        "MV anticorrelated empirical coverage {empirical:.3} outside [0.85, 0.99]"
+    );
+}
