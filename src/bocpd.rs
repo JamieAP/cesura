@@ -3,9 +3,9 @@
 use crate::conformal::{MvScoredDetect, ScoredDetect};
 
 /// Tuple returned by [`BocpdDetector::run_recursion`]:
-/// `(norm, map_rls, cp_probs, original_indices)`. See the method
-/// docstring for the meaning of each field.
-type RecursionOutputs = (Vec<f64>, Vec<usize>, Vec<f64>, Vec<usize>);
+/// `(norm, map_rls, cp_probs, short_mass, original_indices)`. See the
+/// method docstring for the meaning of each field.
+type RecursionOutputs = (Vec<f64>, Vec<usize>, Vec<f64>, Vec<f64>, Vec<usize>);
 use crate::math::log_add_exp;
 use crate::niw;
 use crate::nig::Nig;
@@ -617,10 +617,11 @@ impl<P: Predictive> BocpdDetector<P> {
     ///
     /// Consumed by [`crate::ConformalCpWrapper`] via the
     /// [`crate::ScoredDetect`] trait.
-    /// Run the BOCPD recursion to completion and return `(norm,
-    /// map_rls, cp_probs, original_indices)` -- the four shared
-    /// outputs that `detect`, `detect_with_score`, and `detect_cusum`
-    /// each post-process with a different decision rule.
+    /// Run the BOCPD recursion to completion and return
+    /// `(norm, map_rls, cp_probs, short_mass, original_indices)` --
+    /// the five shared outputs that `detect`, `detect_with_score`,
+    /// `detect_cusum`, and `detect_bayes_factor` each post-process
+    /// with a different decision rule.
     ///
     /// `norm` is normalized using the full finite input series;
     /// `original_indices` maps normalized positions back to the
@@ -630,10 +631,18 @@ impl<P: Predictive> BocpdDetector<P> {
     /// `cp_probs[t]` is `p(r_t = 0 | y_{1:t})` -- the per-step posterior
     /// of being at the first step of a new regime, consumed by the
     /// CUSUM and conformal score paths.
+    /// `short_mass[t]` is `Σ_{r=0..=short_horizon} p(r_t = r | y_{1:t})`
+    /// -- the posterior mass at "regime started recently". `K = 0`
+    /// degenerates to `cp_probs`. `K = 3` parallels MAP-drop's
+    /// `drop_to = 3` and feeds the Bayes-factor decision rule.
     ///
     /// Returns `None` when the input has fewer than 20 finite samples
     /// (early-return parity with the public detection methods).
-    pub(crate) fn run_recursion(&self, data: &[f64]) -> Option<RecursionOutputs> {
+    pub(crate) fn run_recursion(
+        &self,
+        data: &[f64],
+        short_horizon: usize,
+    ) -> Option<RecursionOutputs> {
         let mut original_indices: Vec<usize> = Vec::new();
         let data: Vec<f64> = data
             .iter()
@@ -662,6 +671,8 @@ impl<P: Predictive> BocpdDetector<P> {
         let mut stats = vec![self.prior.clone(); max_r + 1];
         let mut map_rls = Vec::with_capacity(n);
         let mut cp_probs = Vec::with_capacity(n);
+        let mut short_mass = Vec::with_capacity(n);
+        let short_horizon_clamped = short_horizon.min(max_r);
 
         let beta = self.beta;
         let prior_pred_at = |x: f64| self.prior.log_predictive_robust(x, beta);
@@ -722,6 +733,15 @@ impl<P: Predictive> BocpdDetector<P> {
             } else {
                 0.0
             });
+            // Sum P(r_t ≤ short_horizon | data). Clamp to [0, 1] to
+            // absorb numerical drift from the renormalisation above.
+            let sm: f64 = new_rl
+                .iter()
+                .take(short_horizon_clamped + 1)
+                .filter(|v| v.is_finite())
+                .map(|v| v.exp())
+                .sum();
+            short_mass.push(sm.clamp(0.0, 1.0));
             let mut new_stats = vec![self.prior.clone(); max_r + 1];
             for r in 0..=active.min(max_r.saturating_sub(1)) {
                 if r < max_r && new_rl[r + 1] > f64::NEG_INFINITY {
@@ -731,7 +751,7 @@ impl<P: Predictive> BocpdDetector<P> {
             rl_log = new_rl;
             stats = new_stats;
         }
-        Some((norm, map_rls, cp_probs, original_indices))
+        Some((norm, map_rls, cp_probs, short_mass, original_indices))
     }
 
     /// CUSUM-on-cp_probs[] decision rule. Replaces the MAP-drop
@@ -781,7 +801,11 @@ impl<P: Predictive> BocpdDetector<P> {
         cooldown: usize,
     ) -> Vec<ChangePoint> {
         assert!(threshold > 0.0, "threshold must be > 0, got {threshold}");
-        let Some((norm, _map_rls, cp_probs, original_indices)) = self.run_recursion(data) else {
+        // CUSUM only consumes cp_probs; pass short_horizon=0 (degenerate
+        // short_mass = cp_probs, ignored).
+        let Some((norm, _map_rls, cp_probs, _short_mass, original_indices)) =
+            self.run_recursion(data, 0)
+        else {
             return Vec::new();
         };
         let n = norm.len();
@@ -845,6 +869,130 @@ impl<P: Predictive> BocpdDetector<P> {
                 });
                 last_emit = Some(t);
                 s = 0.0;
+            }
+        }
+        out
+    }
+
+    /// Bayes-factor decision rule on aggregated short-run-length mass.
+    ///
+    /// Computes
+    ///
+    /// ```text
+    ///     short_mass[t] = Σ_{r=0..=K} P(r_t = r | y_{1:t})
+    ///     long_mass[t]  = 1 − short_mass[t]
+    ///     BF[t]         = short_mass[t] / max(long_mass[t], 1e-12)
+    /// ```
+    ///
+    /// Emits a CP when `BF[t] > threshold`, then enters a `cooldown`-
+    /// step lockout (no further emission inside the window).
+    ///
+    /// Why this is interesting vs MAP-drop and CUSUM:
+    ///
+    /// 1. **Strictly more posterior info than CUSUM-on-cp_probs[]**:
+    ///    cp_probs is just `P(r=0 | data)` (the numerator of `BF`
+    ///    when `K=0`). The Bayes-factor rule additionally sees the
+    ///    *collapse of long-run-length mass* via the denominator,
+    ///    which is the load-bearing signal MAP-drop's `min_prev_rl`
+    ///    guard tries to capture heuristically.
+    /// 2. The statistic is posterior odds under the configured model
+    ///    of "regime started in the last `K+1` steps" vs "regime
+    ///    is older". The threshold is a posterior-odds level
+    ///    (`threshold=1` ↔ "more posterior at short than long";
+    ///    `threshold=4` ↔ "4× more"); calibration remains empirical.
+    /// 3. `threshold` and `short_horizon` configure the statistic.
+    ///    Emission also uses the cooldown and maturity guards below.
+    ///
+    /// `short_horizon = 3` parallels MAP-drop's `drop_to = 3`. Larger
+    /// `K` integrates more posterior mass at "regime is recent"; for
+    /// the BOCPD geometric-distribution prior, mass at large `K` is
+    /// rare under H₀ so the gain from `K > 3` is modest.
+    ///
+    /// `threshold = 1.0` (BF > 1, i.e. "more posterior at short than
+    /// long") is a permissive starting point. `threshold = 4.0` is a
+    /// stricter setting closer to MAP-drop's effective FAR. Calibrate
+    /// empirically per fixture.
+    ///
+    /// Returns CP indices in the **caller's** input space (non-finite
+    /// samples are filtered before the recursion runs).
+    ///
+    pub fn detect_bayes_factor(
+        &self,
+        data: &[f64],
+        threshold: f64,
+        short_horizon: usize,
+        cooldown: usize,
+    ) -> Vec<ChangePoint> {
+        assert!(threshold > 0.0, "threshold must be > 0, got {threshold}");
+        let Some((norm, _map_rls, cp_probs, short_mass, original_indices)) =
+            self.run_recursion(data, short_horizon)
+        else {
+            return Vec::new();
+        };
+        let n = norm.len();
+
+        let mut out = Vec::new();
+        let mut last_emit: Option<usize> = None;
+        // Posterior-maturity guard. BOCPD starts with all mass at
+        // r = 0 (rl_log[0] = 0, rl_log[r > 0] = -∞), so short_mass is
+        // 1.0 at startup and BF is enormous regardless of the data.
+        // To avoid spurious startup emission, the rule is *armed*
+        // only after BF first drops below 1.0 -- the moment the
+        // posterior has matured enough that long_mass exceeds
+        // short_mass. This auto-handles startup without a magic
+        // warmup number, and re-arms naturally after each emission's
+        // cooldown lockout (the recursion's mass shifts back to short
+        // run lengths post-CP, then matures again).
+        let mut armed = false;
+        for (t, &sm) in short_mass.iter().enumerate() {
+            if let Some(last) = last_emit {
+                if t.saturating_sub(last) <= cooldown {
+                    continue;
+                }
+            }
+            let long_mass = (1.0 - sm).max(1e-12);
+            let bf = sm / long_mass;
+            if !armed {
+                if bf < 1.0 {
+                    armed = true;
+                }
+                continue;
+            }
+            if bf > threshold {
+                let look_back = cooldown.min(t);
+                let confidence = cp_probs[t.saturating_sub(look_back)..=t]
+                    .iter()
+                    .copied()
+                    .fold(0.0_f64, f64::max)
+                    .clamp(0.0, 1.0);
+                let w = 20;
+                let before = &norm[t.saturating_sub(w)..t];
+                let after = &norm[t..(t + w).min(n)];
+                let mean_b = if before.is_empty() {
+                    0.0
+                } else {
+                    before.iter().sum::<f64>() / before.len() as f64
+                };
+                let mean_a = if after.is_empty() {
+                    0.0
+                } else {
+                    after.iter().sum::<f64>() / after.len() as f64
+                };
+                let shift_sigma = (mean_a - mean_b).abs();
+                if shift_sigma < 1e-9 {
+                    continue;
+                }
+                out.push(ChangePoint {
+                    index: original_indices[t],
+                    confidence,
+                    shift_sigma,
+                });
+                last_emit = Some(t);
+                // Disarm so the next emission requires the posterior
+                // to mature in the *new* regime (BF drops below 1
+                // first), preventing same-CP double-fire after the
+                // cooldown lockout expires.
+                armed = false;
             }
         }
         out
@@ -2475,6 +2623,140 @@ mod tests {
             cps[0].index >= 95,
             "index {} too low -- NaN filtering shifted indices",
             cps[0].index
+        );
+    }
+
+    // ── Bayes-factor decision rule ──────────────────────────────────
+
+    #[test]
+    fn detect_bayes_factor_clean_shift() {
+        let mut rng = Rng::new(0xBF51);
+        let mut data: Vec<f64> = (0..150).map(|_| rng.normal(0.0, 1.0)).collect();
+        data.extend((0..150).map(|_| rng.normal(5.0, 1.0)));
+        let det = BocpdDetector::new(200.0, 350);
+        let cps = det.detect_bayes_factor(&data, 1.0, 3, 15);
+        assert!(!cps.is_empty(), "must detect a clean 5σ shift");
+        assert!(
+            (cps[0].index as i64 - 150).abs() < 25,
+            "first CP at {} too far from truth 150",
+            cps[0].index
+        );
+    }
+
+    #[test]
+    fn detect_bayes_factor_arl0_increases_with_threshold() {
+        // Bayes-factor at threshold=1.0 fires when short_mass >
+        // long_mass. Very permissive on stationary data because
+        // transient cp_prob spikes can push mass into low r values.
+        // Pin: ARL₀(0.5) ≤ ARL₀(1.0) ≤ ARL₀(4.0); ARL₀(4.0) ≥ 200.
+        let trials = 5;
+        let mut arl0s = Vec::new();
+        for &thresh in &[0.5_f64, 1.0, 4.0] {
+            let mut total = 0.0;
+            for t in 0..trials {
+                let mut rng = Rng::new(4000 + t);
+                let det = BocpdDetector::new(200.0, 350);
+                let data: Vec<f64> = (0..1000).map(|_| rng.normal(0.0, 1.0)).collect();
+                let cps = det.detect_bayes_factor(&data, thresh, 3, 15);
+                total += cps.first().map(|c| c.index as f64).unwrap_or(1000.0);
+            }
+            let arl0 = total / trials as f64;
+            eprintln!("BF ARL₀ at threshold={thresh}: {arl0:.0}");
+            arl0s.push(arl0);
+        }
+        assert!(
+            arl0s[0] <= arl0s[1] && arl0s[1] <= arl0s[2],
+            "ARL₀ should be monotone non-decreasing in threshold; got {arl0s:?}"
+        );
+        assert!(
+            arl0s[2] >= 200.0,
+            "ARL₀ at threshold=4.0 should be ≥ 200; got {}",
+            arl0s[2]
+        );
+    }
+
+    #[test]
+    fn detect_bayes_factor_threshold_monotone_in_far() {
+        let mut rng = Rng::new(0xBF53);
+        let data: Vec<f64> = (0..2000).map(|_| rng.normal(0.0, 1.0)).collect();
+        let det = BocpdDetector::new(200.0, 350);
+        let cps_low = det.detect_bayes_factor(&data, 0.5, 3, 15);
+        let cps_hi = det.detect_bayes_factor(&data, 4.0, 3, 15);
+        assert!(
+            cps_hi.len() <= cps_low.len(),
+            "expected FAR monotone in threshold; lo={}, hi={}",
+            cps_low.len(),
+            cps_hi.len()
+        );
+    }
+
+    #[test]
+    fn detect_bayes_factor_multi_regime() {
+        let mut rng = Rng::new(0xBF54);
+        let mut data: Vec<f64> = (0..200).map(|_| rng.normal(0.0, 1.0)).collect();
+        data.extend((0..200).map(|_| rng.normal(3.0, 1.0)));
+        data.extend((0..200).map(|_| rng.normal(-2.0, 1.0)));
+        let det = BocpdDetector::new(200.0, 350);
+        let cps = det.detect_bayes_factor(&data, 1.0, 3, 15);
+        assert!(!cps.is_empty());
+        for truth in [200_usize, 400] {
+            let near = cps.iter().any(|c| (c.index as i64 - truth as i64).abs() < 50);
+            assert!(
+                near,
+                "missed truth {truth}; got {:?}",
+                cps.iter().map(|c| c.index).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn detect_bayes_factor_invalid_threshold_panics() {
+        let det = BocpdDetector::new(200.0, 350);
+        let data = vec![0.0_f64; 100];
+        let result = std::panic::catch_unwind(|| {
+            det.detect_bayes_factor(&data, 0.0, 3, 15);
+        });
+        assert!(result.is_err(), "threshold=0 should panic");
+    }
+
+    #[test]
+    fn detect_bayes_factor_short_input_returns_empty() {
+        let det = BocpdDetector::new(200.0, 350);
+        let cps = det.detect_bayes_factor(&[0.0_f64; 10], 1.0, 3, 15);
+        assert!(cps.is_empty());
+    }
+
+    #[test]
+    fn detect_bayes_factor_skips_non_finite_samples() {
+        let mut rng = Rng::new(0xBF55);
+        let mut data: Vec<f64> = (0..100).map(|_| rng.normal(0.0, 1.0)).collect();
+        data.extend((0..100).map(|_| rng.normal(5.0, 1.0)));
+        for v in data.iter_mut().take(10).skip(5) {
+            *v = f64::NAN;
+        }
+        let det = BocpdDetector::new(200.0, 350);
+        let cps = det.detect_bayes_factor(&data, 1.0, 3, 15);
+        assert!(!cps.is_empty());
+        assert!(
+            (cps[0].index as i64 - 100).abs() < 25,
+            "CP should be near raw index 100, got {}",
+            cps[0].index
+        );
+    }
+
+    #[test]
+    fn detect_bayes_factor_horizon_zero_uses_cp_probs_only() {
+        // K=0 ⇒ short_mass = cp_probs (degenerate). BF = cp_probs /
+        // (1 - cp_probs). Test that this still detects on a clean
+        // shift (just less aggressive than K=3).
+        let mut rng = Rng::new(0xBF56);
+        let mut data: Vec<f64> = (0..150).map(|_| rng.normal(0.0, 1.0)).collect();
+        data.extend((0..150).map(|_| rng.normal(5.0, 1.0)));
+        let det = BocpdDetector::new(200.0, 350);
+        let cps = det.detect_bayes_factor(&data, 1.0, 0, 15);
+        assert!(
+            !cps.is_empty(),
+            "K=0 with threshold=1 should still fire on a clean 5σ shift"
         );
     }
 
