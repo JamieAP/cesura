@@ -33,6 +33,25 @@ pub struct DetectorState {
     /// Forward-compat: pre-0.6 snapshots without this field default to 0.
     #[serde(default)]
     pub beta: f64,
+    /// Bayes-factor decision rule state. `None` ⇒ MAP-drop trigger (default).
+    /// Forward-compat: pre-0.9 snapshots default to None.
+    #[serde(default)]
+    pub bf_rule: Option<BfRuleState>,
+}
+
+/// Bayes-factor decision-rule state. When attached to a [`StreamingDetector`]
+/// via [`StreamingDetector::with_bayes_factor_rule`], the streaming detector
+/// uses BF on aggregated short-run-length mass instead of MAP-drop. Mirrors
+/// the offline [`crate::BocpdDetector::detect_bayes_factor`] math; carries
+/// the posterior-maturity `armed` flag and `last_emit` step for cooldown,
+/// both serialised so a daemon checkpointing in BF mode round-trips.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BfRuleState {
+    pub threshold: f64,
+    pub short_horizon: usize,
+    pub cooldown: usize,
+    pub armed: bool,
+    pub last_emit: Option<usize>,
 }
 
 /// Serializable NIG sufficient statistics.
@@ -123,6 +142,10 @@ struct PendingCp {
     raw_index: usize,
     fire_step: usize,
     confidence: f64,
+    /// `true` if pushed by the BF rule. On drain failure (shift_sigma <
+    /// 1e-9), the BF detector re-arms so the offline-matching "small
+    /// shift doesn't burn arm" property is preserved.
+    is_bf: bool,
 }
 
 /// Streaming BOCPD detector -- maintains state between calls to `step()`.
@@ -156,6 +179,8 @@ pub struct StreamingDetector {
     norm_ring: std::collections::VecDeque<f64>,
     /// Detections fired but awaiting a full post-window.
     pending: Vec<PendingCp>,
+    /// Bayes-factor rule state. `None` ⇒ MAP-drop trigger (default).
+    bf_rule: Option<BfRuleState>,
 }
 
 const SHIFT_WINDOW: usize = 20;
@@ -217,7 +242,45 @@ impl StreamingDetector {
             scratch_stats: vec![prior; max_run_length + 1],
             norm_ring: std::collections::VecDeque::with_capacity(2 * SHIFT_WINDOW),
             pending: Vec::new(),
+            bf_rule: None,
         }
+    }
+
+    /// Switch the streaming detector from MAP-drop (default) to the
+    /// Bayes-factor decision rule on aggregated short-run-length mass.
+    /// Mirrors the offline [`crate::BocpdDetector::detect_bayes_factor`].
+    ///
+    /// `threshold`: BF cutoff (e.g. `2.0`).
+    /// `short_horizon`: K -- mass over r ∈ {0..=K} forms the short side.
+    /// `cooldown`: minimum steps between consecutive emissions.
+    ///
+    /// The rule arms only after BF first drops below 1.0 (posterior
+    /// maturity), avoiding the all-mass-at-zero startup spike. Disarms
+    /// after each emission so the next fire requires the new regime's
+    /// posterior to mature again.
+    ///
+    /// # Panics
+    /// Panics if `threshold <= 0` or `short_horizon >= max_rl`.
+    pub fn with_bayes_factor_rule(
+        mut self,
+        threshold: f64,
+        short_horizon: usize,
+        cooldown: usize,
+    ) -> Self {
+        assert!(threshold > 0.0, "threshold must be > 0, got {threshold}");
+        assert!(
+            short_horizon < self.max_rl,
+            "short_horizon {short_horizon} must be < max_rl {}",
+            self.max_rl
+        );
+        self.bf_rule = Some(BfRuleState {
+            threshold,
+            short_horizon,
+            cooldown,
+            armed: false,
+            last_emit: None,
+        });
+        self
     }
 
     /// Opt into β-divergence robust BOCPD (see [`crate::BocpdDetector::with_beta`]).
@@ -353,6 +416,10 @@ impl StreamingDetector {
             }
 
             // Drain any pending detections whose post-window is now full.
+            // Borrow-split: collect drained candidates first, then mutate
+            // `self.bf_rule` for any failed BF drains so the BF rule can
+            // re-arm (offline parity: shift_sigma < 1e-9 must not burn arm).
+            let mut drained_failed_bf = false;
             self.pending.retain(|p| {
                 if self.total_steps >= p.fire_step + SHIFT_WINDOW {
                     let shift_sigma = compute_shift_sigma(
@@ -366,39 +433,105 @@ impl StreamingDetector {
                             confidence: p.confidence,
                             shift_sigma,
                         });
+                    } else if p.is_bf {
+                        // Offline `detect_bayes_factor` continues without
+                        // disarming when shift_sigma < 1e-9. Mirror that.
+                        drained_failed_bf = true;
                     }
                     false
                 } else {
                     true
                 }
             });
+            if drained_failed_bf {
+                if let Some(bf) = self.bf_rule.as_mut() {
+                    bf.armed = true;
+                }
+            }
 
-            // Change point detection (same trigger logic as batch).
-            let drop_to = 3;
-            let min_prev_rl = 30;
-            let cooldown = 15;
+            // Change-point detection. Dispatch on the configured decision
+            // rule: BF (opt-in via with_bayes_factor_rule) or MAP-drop.
             let i = self.total_steps - 1;
 
-            if i >= min_prev_rl && self.map_rls[i] <= drop_to && i - self.last_detection >= cooldown
-            {
-                let prev_max = self.map_rls[i.saturating_sub(15)..i]
-                    .iter()
-                    .copied()
-                    .max()
-                    .unwrap_or(0);
-                if prev_max >= min_prev_rl {
-                    let look_back = cooldown.min(i);
-                    let confidence = self.cp_probs[i.saturating_sub(look_back)..=i]
+            if let Some(bf) = self.bf_rule.as_mut() {
+                // Offline-vs-streaming divergence note: offline
+                // `detect_bayes_factor` does not commit `last_emit` /
+                // `armed` when shift_sigma < 1e-9 (i.e. neither cooldown
+                // nor arm is "burned"). Streaming commits both at trigger
+                // to prevent multi-trigger pile-up during the post-window;
+                // failed-drain re-arming above restores the arm so the
+                // detector can fire again on the next posterior-maturity
+                // cycle. Cooldown remains burned on a failed drain,
+                // which can affect the next possible emission. Compare
+                // both paths on representative application fixtures.
+                let in_cooldown = matches!(
+                    bf.last_emit,
+                    Some(le) if i.saturating_sub(le) <= bf.cooldown
+                );
+                if !in_cooldown {
+                    // short_mass = Σ_{r ∈ 0..=K} P(r_t = r | y_{1:t}).
+                    // rl_log is the just-swapped, normalised posterior.
+                    let cap = bf.short_horizon.min(self.max_rl);
+                    let mut sm_log = f64::NEG_INFINITY;
+                    for r in 0..=cap {
+                        let v = self.rl_log[r];
+                        if v.is_finite() {
+                            sm_log = log_add_exp(sm_log, v);
+                        }
+                    }
+                    let sm = if sm_log.is_finite() { sm_log.exp() } else { 0.0 };
+                    let long = (1.0 - sm).max(1e-12);
+                    let bf_val = sm / long;
+
+                    if !bf.armed {
+                        if bf_val < 1.0 {
+                            bf.armed = true;
+                        }
+                    } else if bf_val > bf.threshold {
+                        let look_back = bf.cooldown.min(i);
+                        let confidence = self.cp_probs[i.saturating_sub(look_back)..=i]
+                            .iter()
+                            .copied()
+                            .fold(0.0_f64, f64::max)
+                            .clamp(0.0, 1.0);
+                        bf.last_emit = Some(i);
+                        bf.armed = false;
+                        self.pending.push(PendingCp {
+                            raw_index: self.raw_index_map[i],
+                            fire_step: self.total_steps,
+                            confidence,
+                            is_bf: true,
+                        });
+                    }
+                }
+            } else {
+                let drop_to = 3;
+                let min_prev_rl = 30;
+                let cooldown = 15;
+                if i >= min_prev_rl
+                    && self.map_rls[i] <= drop_to
+                    && i - self.last_detection >= cooldown
+                {
+                    let prev_max = self.map_rls[i.saturating_sub(15)..i]
                         .iter()
                         .copied()
-                        .fold(0.0_f64, f64::max)
-                        .clamp(0.0, 1.0);
-                    self.last_detection = i;
-                    self.pending.push(PendingCp {
-                        raw_index: self.raw_index_map[i],
-                        fire_step: self.total_steps,
-                        confidence,
-                    });
+                        .max()
+                        .unwrap_or(0);
+                    if prev_max >= min_prev_rl {
+                        let look_back = cooldown.min(i);
+                        let confidence = self.cp_probs[i.saturating_sub(look_back)..=i]
+                            .iter()
+                            .copied()
+                            .fold(0.0_f64, f64::max)
+                            .clamp(0.0, 1.0);
+                        self.last_detection = i;
+                        self.pending.push(PendingCp {
+                            raw_index: self.raw_index_map[i],
+                            fire_step: self.total_steps,
+                            confidence,
+                            is_bf: false,
+                        });
+                    }
                 }
             }
         }
@@ -427,6 +560,7 @@ impl StreamingDetector {
             raw_steps: self.raw_steps,
             raw_index_map: self.raw_index_map.clone(),
             beta: self.beta,
+            bf_rule: self.bf_rule.clone(),
         }
     }
 
@@ -489,6 +623,7 @@ impl StreamingDetector {
             scratch_stats: vec![prior; state.max_rl + 1],
             norm_ring: std::collections::VecDeque::with_capacity(2 * SHIFT_WINDOW),
             pending: Vec::new(),
+            bf_rule: state.bf_rule,
         })
     }
 
@@ -933,5 +1068,82 @@ mod tests {
             "streaming tick took {}ms, need <60ms (debug) / <10ms (release)",
             elapsed.as_millis()
         );
+    }
+
+    #[test]
+    fn streaming_bf_detects_clean_shift() {
+        let mut det =
+            StreamingDetector::new(200.0, 250).with_bayes_factor_rule(2.0, 3, 15);
+        let data: Vec<f64> = std::iter::repeat_n(0.0, 100)
+            .chain(std::iter::repeat_n(5.0, 100))
+            .collect();
+        let cps = det.step(&data);
+        assert!(!cps.is_empty(), "BF rule should detect the mean shift");
+        assert!(
+            (cps[0].index as i64 - 100).abs() < 25,
+            "BF CP near 100, got {}",
+            cps[0].index
+        );
+    }
+
+    #[test]
+    fn streaming_bf_no_startup_fire() {
+        // Posterior-maturity guard: with only stationary data (no real shift)
+        // BF must not emit. The all-mass-at-r=0 startup spike is what the
+        // armed flag specifically defends against.
+        let mut det =
+            StreamingDetector::new(200.0, 250).with_bayes_factor_rule(2.0, 3, 15);
+        let mut rng = crate::eval::Rng::new(7);
+        let data: Vec<f64> = (0..200).map(|_| rng.normal(0.0, 1.0)).collect();
+        let cps = det.step(&data);
+        assert!(
+            cps.is_empty(),
+            "stationary data → 0 CPs, got {} ({:?})",
+            cps.len(),
+            cps.iter().map(|c| c.index).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn streaming_bf_state_save_restore_roundtrips() {
+        // Run partial sequence under BF rule, save+restore, finish on both;
+        // detections must match identically.
+        let mut det =
+            StreamingDetector::new(200.0, 250).with_bayes_factor_rule(2.0, 3, 15);
+        let phase1: Vec<f64> = std::iter::repeat_n(0.0, 80).collect();
+        det.step(&phase1);
+
+        let json = serde_json::to_string(&det.save_state()).unwrap();
+        let restored: DetectorState = serde_json::from_str(&json).unwrap();
+        // Round-trip must preserve the BF rule (else continuation silently
+        // falls back to MAP-drop with a different `last_detection` bookkeeping).
+        assert!(
+            restored.bf_rule.is_some(),
+            "bf_rule must survive serde round-trip"
+        );
+        let mut det2 = StreamingDetector::restore(restored).unwrap();
+
+        let phase2: Vec<f64> = std::iter::repeat_n(5.0, 120).collect();
+        let cps1 = det.step(&phase2);
+        let cps2 = det2.step(&phase2);
+        assert_eq!(cps1.len(), cps2.len(), "BF restore drift in CP count");
+        for (a, b) in cps1.iter().zip(cps2.iter()) {
+            assert_eq!(a.index, b.index, "BF restore drift in CP index");
+            assert!((a.confidence - b.confidence).abs() < 1e-9);
+        }
+    }
+
+    #[test]
+    fn streaming_bf_old_state_without_bf_rule_loads() {
+        // Forward-compat: a v0.8 snapshot has no `bf_rule` field. After
+        // round-trip the restored detector should default to MAP-drop.
+        let mut det = StreamingDetector::new(200.0, 250);
+        det.step(&vec![0.0; 80]);
+        let mut state_json = serde_json::to_value(det.save_state()).unwrap();
+        // Drop the bf_rule field to simulate a pre-0.9 snapshot.
+        state_json.as_object_mut().unwrap().remove("bf_rule");
+        let restored: DetectorState = serde_json::from_value(state_json).unwrap();
+        assert!(restored.bf_rule.is_none());
+        let _det = StreamingDetector::restore(restored).unwrap();
     }
 }

@@ -159,6 +159,60 @@ fn v05_state_with_beta_round_trip() {
     }
 }
 
+#[test]
+fn v09_state_with_bf_rule_round_trips() {
+    // Save with BF rule attached, restore, continue. Subsequent step()
+    // output must match a fresh detector also configured with BF on the
+    // same input -- the regression that this test guards is the BF rule
+    // silently downgrading to MAP-drop after restore (different
+    // detection cadence, different `last_detection` vs `bf_rule.last_emit`).
+    let mut a =
+        StreamingDetector::new(200.0, 250).with_bayes_factor_rule(2.0, 3, 15);
+    let mut rng = Rng::new(42);
+    let warmup: Vec<f64> = (0..120).map(|_| rng.normal(0.0, 1.0)).collect();
+    a.step(&warmup);
+
+    let json = serde_json::to_string(&a.save_state()).unwrap();
+    let restored: DetectorState = serde_json::from_str(&json).unwrap();
+    assert!(
+        restored.bf_rule.is_some(),
+        "bf_rule missing from serialised state"
+    );
+    let bf = restored.bf_rule.as_ref().unwrap();
+    assert_eq!(bf.threshold, 2.0);
+    assert_eq!(bf.short_horizon, 3);
+    assert_eq!(bf.cooldown, 15);
+    let mut a_restored = StreamingDetector::restore(restored).unwrap();
+
+    let mut b =
+        StreamingDetector::new(200.0, 250).with_bayes_factor_rule(2.0, 3, 15);
+    b.step(&warmup);
+
+    let mut rng2 = Rng::new(99);
+    let post: Vec<f64> = (0..200)
+        .map(|i| if i < 100 { rng2.normal(0.0, 1.0) } else { rng2.normal(4.0, 1.0) })
+        .collect();
+    let cps_a = a_restored.step(&post);
+    let cps_b = b.step(&post);
+    // Non-empty assertion: a silent regression where BF restoration drops
+    // the rule (falling back to MAP-drop with a different cadence) might
+    // happen to produce zero CPs on both sides, passing a vacuous
+    // length-equality. Anchor on the post-warmup 4σ shift firing.
+    assert!(
+        !cps_a.is_empty(),
+        "BF rule should fire on the post-warmup 4σ shift after restore -- got 0 CPs (silent rule downgrade?)"
+    );
+    assert_eq!(
+        cps_a.len(),
+        cps_b.len(),
+        "restored BF detector diverged in CP count: {cps_a:?} vs {cps_b:?}"
+    );
+    for (x, y) in cps_a.iter().zip(cps_b.iter()) {
+        assert_eq!(x.index, y.index, "CP index drift after BF restore");
+        assert!((x.confidence - y.confidence).abs() < 1e-9);
+    }
+}
+
 #[cfg(feature = "joint-detection")]
 #[test]
 fn chen_wu_state_round_trip() {
