@@ -148,7 +148,7 @@ pub struct HcAggregatorState {
 }
 
 fn default_hc_persistence() -> usize {
-    1
+    2
 }
 
 fn default_hc_warmup() -> usize {
@@ -194,7 +194,7 @@ impl<S: ScoreStream> HcAggregator<S> {
             // warmup = rank window capacity so the empirical CDF is
             // populated from a full window before HC fires.
             warmup: 100,
-            persistence: 1,
+            persistence: 2,
             armed: false,
             last_emit: None,
             step_count: 0,
@@ -232,8 +232,7 @@ impl<S: ScoreStream> HcAggregator<S> {
     }
 
     /// Persistence filter: require HC > threshold for `n` consecutive
-    /// steps before firing. Default 1 (no filter; backwards-compat
-    /// with the single-step baseline).
+    /// steps before firing. Default 2.
     ///
     ///
     ///
@@ -551,7 +550,8 @@ mod tests {
         let mut agg = HcAggregator::new(vec![s0, s1, s2, s3])
             .with_threshold(1.5)
             .with_rank_window(30)
-            .with_warmup(30);
+            .with_warmup(30)
+            .with_persistence(1); // single-step fixture; persistence=1 behavior
         let dummy_obs: Vec<Vec<f64>> = (0..60).map(|_| vec![0.0, 0.0, 0.0, 0.0]).collect();
         let cps = agg.step(&dummy_obs);
         assert!(!cps.is_empty(), "HC should fire on a 1-of-4 spike");
@@ -702,13 +702,17 @@ mod tests {
     }
 
     #[test]
-    fn persistence_default_is_one_no_filter() {
-        // Default persistence=1 permits a fire on any
-        // single-step above-τ fires immediately.
-        let mk = |spike_step: Option<usize>, spike: f64| {
+    fn persistence_default_is_two() {
+        // Default persistence=2 blocks 1-step transients
+        // and fires on 2-step sustained excursions. Sustained spike
+        // of 50.0 over 5 steps from step 50; rank-extreme for the
+        // first ~2-3 steps before window saturates → fires.
+        let mk = |sustain_from: Option<usize>, value: f64| {
             let mut v = vec![1.0; 100];
-            if let Some(idx) = spike_step {
-                v[idx] = spike;
+            if let Some(start) = sustain_from {
+                for s in &mut v[start..(start + 5).min(100)] {
+                    *s = value;
+                }
             }
             ScriptedStream::new(v, ScoreKind::BayesFactor)
         };
@@ -720,12 +724,11 @@ mod tests {
             .with_threshold(1.5)
             .with_rank_window(30)
             .with_warmup(30);
-        // No with_persistence call → uses default 1.
         let dummy: Vec<Vec<f64>> = (0..100).map(|_| vec![0.0; 4]).collect();
         let cps = agg.step(&dummy);
         assert!(
             !cps.is_empty(),
-            "persistence=1 (default) should fire on single-step spike"
+            "persistence=2 (default) should fire on sustained excursion"
         );
     }
 
@@ -747,7 +750,7 @@ mod tests {
 
     #[test]
     fn persistence_forward_compat_zero_clamped_to_one() {
-        // Snapshots without `persistence` use the default of 1. But
+        // Snapshots without `persistence` use the default of 2. But
         // a hand-crafted snapshot with 0 should clamp to 1 on restore
         // (avoid the divide-by-zero / fire-immediately edge case).
         let mk = || ScriptedStream::new(vec![0.7; 60], ScoreKind::BayesFactor);
