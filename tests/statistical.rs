@@ -2002,3 +2002,254 @@ fn ar1_eval_aggregate_meets_floor() {
         agg.f1
     );
 }
+
+// ── ConformalCpWrapper ──────────────────────────────────────
+
+/// Bit-equality: wrapper-emitted CP indices match the unwrapped
+/// `BocpdDetector::detect` output. Guards against accidental drop /
+/// reorder in the `ScoredDetect` impl.
+#[test]
+fn conformal_wrapper_preserves_detection() {
+    use cesura::{BocpdDetector, ConformalCpWrapper, ScoredDetect};
+
+    let mut rng = Rng::new(0xC0CA);
+    let mut data: Vec<f64> = (0..400).map(|_| rng.normal(0.0, 1.0)).collect();
+    data.extend((0..400).map(|_| rng.normal(4.0, 1.0)));
+    data.extend((0..400).map(|_| rng.normal(0.0, 1.0)));
+
+    let det = BocpdDetector::new(200.0, 500);
+    let baseline: Vec<usize> = det.detect(&data).iter().map(|c| c.index).collect();
+    let scored: Vec<usize> = det
+        .detect_with_score(&data)
+        .iter()
+        .map(|(c, _)| c.index)
+        .collect();
+    assert_eq!(baseline, scored, "ScoredDetect must preserve detect() indices");
+
+    let mut wrapped = ConformalCpWrapper::new(BocpdDetector::new(200.0, 500))
+        .with_calibration_capacity(50)
+        .with_coverage(0.9);
+    let conformal: Vec<usize> = wrapped.detect(&data).iter().map(|c| c.cp.index).collect();
+    assert_eq!(baseline, conformal, "wrapper must preserve detect() indices");
+}
+
+/// Empirical coverage on the score's reference point (BOCPD's MAP-
+/// collapse step `t_collapse`). For each post-warmup CP, the wrapper's
+/// timing interval must contain `t_collapse = cp.index − score`.
+///
+/// Coverage is asserted against `t_collapse`, not the latent "true CP",
+/// because the score directly calibrates the trigger-to-collapse offset
+/// distribution. The detection-lag bias between `t_collapse` and the
+/// latent CP is a separate uncalibrated quantity; CPTC-style
+/// regime-state-conditional calibration (Sun & Yu 2025) is the
+/// follow-up that addresses it.
+#[test]
+fn conformal_wrapper_coverage_is_nominal() {
+    use cesura::{BocpdDetector, ConformalCpWrapper, ScoredDetect};
+
+    let regime_len = 100usize;
+    let n_regimes = 250usize;
+    let shift = 1.0;
+    let mut rng = Rng::new(0xDEADBEEF);
+    let mut data = Vec::with_capacity(regime_len * n_regimes);
+    for r in 0..n_regimes {
+        let mu = if r % 2 == 0 { 0.0 } else { shift };
+        for _ in 0..regime_len {
+            data.push(rng.normal(mu, 1.0));
+        }
+    }
+
+    let cap = 50;
+    let coverage = 0.9;
+    let det = BocpdDetector::new(80.0, regime_len + 50);
+    let scored = det.detect_with_score(&data);
+
+    let mut wrapper = ConformalCpWrapper::new(BocpdDetector::new(80.0, regime_len + 50))
+        .with_calibration_capacity(cap)
+        .with_coverage(coverage);
+    let conformal = wrapper.detect(&data);
+    assert_eq!(conformal.len(), scored.len(), "1:1 emission parity");
+
+    let post: Vec<(usize, &cesura::ConformalCp, f64)> = conformal
+        .iter()
+        .zip(scored.iter())
+        .enumerate()
+        .filter(|(idx, _)| *idx >= cap)
+        .map(|(idx, (c, (_, s)))| (idx, c, *s))
+        .collect();
+    assert!(
+        post.len() >= 100,
+        "need ≥ 100 post-warmup CPs, got {} (total {})",
+        post.len(),
+        conformal.len()
+    );
+
+    let contained = post
+        .iter()
+        .filter(|(_, c, score)| {
+            let t_collapse = c.cp.index as i64 - score.round() as i64;
+            let (lo, hi) = c.timing_interval;
+            lo <= t_collapse && t_collapse <= hi
+        })
+        .count();
+    let empirical = contained as f64 / post.len() as f64;
+    eprintln!(
+        "post-warmup CPs={} empirical_coverage={:.3} (nominal {:.2})",
+        post.len(),
+        empirical,
+        coverage
+    );
+    // Lower bound 0.85 is the conformal contract (≥ nominal − slack);
+    // upper bound 0.99 accepts the structural over-coverage of a
+    // discrete-valued score under nearest-rank quantile (ties at the
+    // lower boundary inflate empirical coverage above nominal). A
+    // ceiling here still catches gross degeneracies (e.g. an always-
+    // zero score, which would pin coverage at 1.0).
+    assert!(
+        (0.85..=0.99).contains(&empirical),
+        "empirical coverage {empirical:.3} outside [0.85, 0.99]"
+    );
+}
+
+/// Calibration-buffer warmup: interval-width variance over the second
+/// 100 CPs (rolling) should be tighter than over the first 100 CPs
+/// (filling) by at least a factor of 5.
+#[test]
+fn conformal_calibration_buffer_grows_then_stabilises() {
+    use cesura::{BocpdDetector, ConformalCpWrapper};
+
+    let regime_len = 100usize;
+    let n_regimes = 300usize;
+    let shift = 4.0;
+    let mut rng = Rng::new(0xAB1A);
+    let mut data = Vec::with_capacity(regime_len * n_regimes);
+    for r in 0..n_regimes {
+        let mu = if r % 2 == 0 { 0.0 } else { shift };
+        for _ in 0..regime_len {
+            data.push(rng.normal(mu, 1.0));
+        }
+    }
+
+    let mut wrapper = ConformalCpWrapper::new(BocpdDetector::new(80.0, regime_len + 50))
+        .with_calibration_capacity(100)
+        .with_coverage(0.9);
+    let conformal = wrapper.detect(&data);
+    assert!(
+        conformal.len() >= 200,
+        "need ≥ 200 CPs to test variance regimes, got {}",
+        conformal.len()
+    );
+
+    let widths: Vec<f64> = conformal
+        .iter()
+        .map(|c| (c.timing_interval.1 - c.timing_interval.0) as f64)
+        .collect();
+    let var = |xs: &[f64]| {
+        let m = xs.iter().sum::<f64>() / xs.len() as f64;
+        xs.iter().map(|x| (x - m).powi(2)).sum::<f64>() / xs.len() as f64
+    };
+    let early = var(&widths[..100]);
+    let later = var(&widths[100..200]);
+    eprintln!(
+        "buffer width variance: first100={early:.3} second100={later:.3} ratio={:.3}",
+        if early > 0.0 { later / early } else { f64::NAN }
+    );
+    // Buffer is full from CP 100 onward → variance should drop sharply.
+    assert!(
+        later <= 0.20 * early.max(1e-9),
+        "variance over rolling window ({later:.3}) should be ≤ 20% of growing-window variance ({early:.3})"
+    );
+}
+
+/// Smoke test: wrapper composes over the ensemble.
+#[test]
+fn conformal_wrapper_works_over_ensemble() {
+    use cesura::{ConformalCpWrapper, EnsembleDetector};
+
+    let data: Vec<f64> = std::iter::repeat_n(0.0, 200)
+        .chain(std::iter::repeat_n(5.0, 200))
+        .collect();
+    let mut wrapper =
+        ConformalCpWrapper::new(EnsembleDetector::new(200.0, 350)).with_calibration_capacity(8);
+    let cps = wrapper.detect(&data);
+    assert!(!cps.is_empty(), "ensemble-wrapped wrapper should emit ≥ 1 CP");
+    for c in &cps {
+        let (lo, hi) = c.timing_interval;
+        assert!(lo <= hi, "interval must be non-empty: ({lo}, {hi})");
+    }
+}
+
+///
+/// Per-regime conditioning (CPTC-style) is a possible extension; if
+/// this test ever fails, that's the natural escalation.
+#[test]
+fn conformal_wrapper_coverage_under_snr_transition() {
+    use cesura::{BocpdDetector, ConformalCpWrapper, ScoredDetect};
+
+    let regime_len = 100usize;
+    // 200 alternating-regime pairs: first 100 at shift=1σ, second 100
+    // at shift=4σ. Crosses the SNR transition mid-stream so the buffer
+    // accumulates contaminated history at exactly the moment under
+    // test.
+    let n_low = 100usize;
+    let n_high = 100usize;
+    let shift_low = 1.0_f64;
+    let shift_high = 4.0_f64;
+    let mut rng = Rng::new(0xBADCAFE);
+    let mut data = Vec::with_capacity(regime_len * (n_low + n_high));
+    for r in 0..n_low {
+        let mu = if r % 2 == 0 { 0.0 } else { shift_low };
+        for _ in 0..regime_len {
+            data.push(rng.normal(mu, 1.0));
+        }
+    }
+    for r in 0..n_high {
+        let mu = if r % 2 == 0 { 0.0 } else { shift_high };
+        for _ in 0..regime_len {
+            data.push(rng.normal(mu, 1.0));
+        }
+    }
+
+    let cap = 50;
+    let coverage = 0.9;
+    let det = BocpdDetector::new(80.0, regime_len + 50);
+    let scored = det.detect_with_score(&data);
+
+    let mut wrapper = ConformalCpWrapper::new(BocpdDetector::new(80.0, regime_len + 50))
+        .with_calibration_capacity(cap)
+        .with_coverage(coverage);
+    let conformal = wrapper.detect(&data);
+    assert_eq!(conformal.len(), scored.len(), "1:1 emission parity");
+
+    let post: Vec<(usize, &cesura::ConformalCp, f64)> = conformal
+        .iter()
+        .zip(scored.iter())
+        .enumerate()
+        .filter(|(idx, _)| *idx >= cap)
+        .map(|(idx, (c, (_, s)))| (idx, c, *s))
+        .collect();
+    assert!(post.len() >= 100, "need ≥ 100 post-warmup CPs, got {}", post.len());
+
+    let contained = post
+        .iter()
+        .filter(|(_, c, score)| {
+            let t_collapse = c.cp.index as i64 - score.round() as i64;
+            let (lo, hi) = c.timing_interval;
+            lo <= t_collapse && t_collapse <= hi
+        })
+        .count();
+    let empirical = contained as f64 / post.len() as f64;
+    eprintln!(
+        "snr-transition: post-warmup CPs={} empirical_coverage={:.3} (nominal {:.2})",
+        post.len(),
+        empirical,
+        coverage
+    );
+    // Looser band than `conformal_wrapper_coverage_is_nominal` because
+    // cross-regime contamination is expected to widen the empirical-
+    // coverage spread; ≥ 0.85 keeps the conformal lower-bound contract.
+    assert!(
+        (0.85..=0.99).contains(&empirical),
+        "marginal-across-regimes coverage {empirical:.3} outside [0.85, 0.99]"
+    );
+}

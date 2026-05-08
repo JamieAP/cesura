@@ -65,3 +65,8 @@ required-features = ["test-utils", "joint-detection"]
 name = "focus_pruning"
 harness = false
 required-features = ["test-utils"]
+
+[[bench]]
+name = "conformal_overhead"
+harness = false
+required-features = ["test-utils"]

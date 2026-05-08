@@ -3,7 +3,12 @@
 //!
 //! Reference: Romano, Eckley, Fearnhead, Rigaill (2023), "Fast Online
 //! Change Point Detection via Functional Pruning CUSUM Statistics"
-//! (arXiv:2302.04743 / JMLR v24/21-1230).
+//! (arXiv:2110.08205 / JMLR v24/21-1230). Ward, Romano, Eckley,
+//! Fearnhead (2024) "A Constant-per-Iteration Likelihood Ratio Test
+//! for Online Changepoint Detection for Exponential Family Models"
+//! (arXiv:2302.04743, Statistics and Computing) is the §5 adaptive
+//! maxima-checking follow-up. That method is not implemented by
+//! `with_pruning` here.
 //!
 //! Two inner-loop modes:
 //! - Naive (default): O(t) per step. Walks all candidate split points τ.

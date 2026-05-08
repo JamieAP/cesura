@@ -18,6 +18,7 @@
 //!
 
 use crate::bocpd::BocpdDetector;
+use crate::conformal::ScoredDetect;
 use crate::detrend::{dominant_period_via_acf, seasonal_difference};
 use crate::focus::FocusDetector;
 use crate::nig::Nig;
@@ -130,6 +131,51 @@ impl<P: Predictive> EnsembleDetector<P> {
             .map(|cp| ChangePoint {
                 index: cp.index + shift,
                 ..cp
+            })
+            .collect()
+    }
+}
+
+impl<P: Predictive> ScoredDetect for EnsembleDetector<P> {
+    /// Mirrors [`EnsembleDetector::detect`] but forwards the underlying
+    /// BOCPD score through the FOCuS-confirmation filter. Score units
+    /// follow [`BocpdDetector::detect_with_score`]: trigger-to-MAP-CP
+    /// offset on the **working series**.
+    ///
+    fn detect_with_score(&self, data: &[f64]) -> Vec<(ChangePoint, f64)> {
+        let (working_data, shift): (std::borrow::Cow<'_, [f64]>, usize) = if self.auto_detrend {
+            match dominant_period_via_acf(data) {
+                Some(p) if p > 0 && p < data.len() / 4 => {
+                    (std::borrow::Cow::Owned(seasonal_difference(data, p)), p)
+                }
+                _ => (std::borrow::Cow::Borrowed(data), 0),
+            }
+        } else {
+            (std::borrow::Cow::Borrowed(data), 0)
+        };
+
+        let bocpd_scored = self.bocpd.detect_with_score(&working_data);
+        let mut focus = FocusDetector::new(self.focus_threshold);
+        let focus_cps = focus.detect(&working_data);
+        let tol = self.tolerance as i64;
+        bocpd_scored
+            .into_iter()
+            .filter(|(cp, _)| {
+                if cp.confidence >= self.confidence_floor {
+                    return true;
+                }
+                focus_cps
+                    .iter()
+                    .any(|f| (f.index as i64 - cp.index as i64).abs() <= tol)
+            })
+            .map(|(cp, score)| {
+                (
+                    ChangePoint {
+                        index: cp.index + shift,
+                        ..cp
+                    },
+                    score,
+                )
             })
             .collect()
     }

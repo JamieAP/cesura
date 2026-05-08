@@ -1,5 +1,6 @@
 //! Bayesian Online Change Point detector (univariate + multivariate).
 
+use crate::conformal::ScoredDetect;
 use crate::math::log_add_exp;
 use crate::niw;
 use crate::nig::Nig;
@@ -608,6 +609,194 @@ impl<P: Predictive> BocpdDetector<P> {
         (cps, cp_probs, original_indices)
     }
 
+    ///
+    /// Consumed by [`crate::ConformalCpWrapper`] via the
+    /// [`crate::ScoredDetect`] trait.
+    pub(crate) fn detect_with_score(&self, data: &[f64]) -> Vec<(ChangePoint, f64)> {
+        let mut original_indices: Vec<usize> = Vec::new();
+        let data: Vec<f64> = data
+            .iter()
+            .enumerate()
+            .filter_map(|(i, &v)| {
+                if v.is_finite() {
+                    original_indices.push(i);
+                    Some(v)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let n = data.len();
+        if n < 20 {
+            return vec![];
+        }
+
+        let mean = data.iter().sum::<f64>() / n as f64;
+        let std = (data.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / n as f64).sqrt();
+        let std = if std < 1e-10 { 1.0 } else { std };
+        let norm: Vec<f64> = data.iter().map(|x| (x - mean) / std).collect();
+
+        let max_r = self.max_rl.min(n);
+        let mut rl_log = vec![f64::NEG_INFINITY; max_r + 1];
+        rl_log[0] = 0.0;
+        let mut stats = vec![self.prior.clone(); max_r + 1];
+        let mut map_rls = Vec::with_capacity(n);
+        let mut cp_probs = Vec::with_capacity(n);
+
+        let beta = self.beta;
+        let prior_pred_at = |x: f64| self.prior.log_predictive_robust(x, beta);
+        let hazard_log = self.hazard_log();
+        let growth_log = self.growth_log();
+
+        for (t, &x) in norm.iter().enumerate() {
+            let active = (t + 1).min(max_r);
+            let mut new_rl = vec![f64::NEG_INFINITY; max_r + 1];
+            let mut prev_mass = f64::NEG_INFINITY;
+            for r in 0..=active.min(max_r.saturating_sub(1)) {
+                if rl_log[r] == f64::NEG_INFINITY {
+                    continue;
+                }
+                let pred = stats[r].log_predictive_robust(x, beta);
+                if !pred.is_finite() {
+                    continue;
+                }
+                if r < max_r {
+                    new_rl[r + 1] = log_add_exp(new_rl[r + 1], rl_log[r] + pred + growth_log);
+                }
+                prev_mass = log_add_exp(prev_mass, rl_log[r]);
+            }
+            let prior_pred = prior_pred_at(x);
+            new_rl[0] = if prior_pred.is_finite() && prev_mass.is_finite() {
+                prev_mass + hazard_log + prior_pred
+            } else {
+                f64::NEG_INFINITY
+            };
+            let evidence = new_rl
+                .iter()
+                .copied()
+                .filter(|v| v.is_finite())
+                .fold(f64::NEG_INFINITY, log_add_exp);
+            if evidence.is_finite() {
+                for v in new_rl.iter_mut() {
+                    *v -= evidence;
+                }
+            }
+            if self.log_mass_cutoff > f64::NEG_INFINITY {
+                for r in (1..=max_r).rev() {
+                    if new_rl[r] >= self.log_mass_cutoff {
+                        break;
+                    }
+                    new_rl[r] = f64::NEG_INFINITY;
+                }
+            }
+            let map_r = new_rl
+                .iter()
+                .enumerate()
+                .filter(|(_, v)| v.is_finite())
+                .max_by(|a, b| a.1.total_cmp(b.1))
+                .map(|(r, _)| r)
+                .unwrap_or(0);
+            map_rls.push(map_r);
+            cp_probs.push(if new_rl[0].is_finite() {
+                new_rl[0].exp()
+            } else {
+                0.0
+            });
+            let mut new_stats = vec![self.prior.clone(); max_r + 1];
+            for r in 0..=active.min(max_r.saturating_sub(1)) {
+                if r < max_r && new_rl[r + 1] > f64::NEG_INFINITY {
+                    new_stats[r + 1] = stats[r].update(x);
+                }
+            }
+            rl_log = new_rl;
+            stats = new_stats;
+        }
+
+        let drop_to = 3;
+        let min_prev_rl = 30;
+        let cooldown = 15;
+
+        let mut result = Vec::new();
+        let mut i = min_prev_rl;
+        let mut last_detection = 0usize;
+        while i < n {
+            if map_rls[i] <= drop_to && i - last_detection >= cooldown {
+                let prev_max = map_rls[i.saturating_sub(15)..i]
+                    .iter()
+                    .copied()
+                    .max()
+                    .unwrap_or(0);
+                if prev_max >= min_prev_rl {
+                    let look_back = cooldown.min(i);
+                    let confidence = cp_probs[i.saturating_sub(look_back)..=i]
+                        .iter()
+                        .copied()
+                        .fold(0.0_f64, f64::max)
+                        .clamp(0.0, 1.0);
+                    let w = 20;
+                    let before = &norm[i.saturating_sub(w)..i];
+                    let after = &norm[i..(i + w).min(n)];
+                    let mean_b = if before.is_empty() {
+                        0.0
+                    } else {
+                        before.iter().sum::<f64>() / before.len() as f64
+                    };
+                    let mean_a = if after.is_empty() {
+                        0.0
+                    } else {
+                        after.iter().sum::<f64>() / after.len() as f64
+                    };
+                    let shift_sigma = (mean_a - mean_b).abs();
+                    if shift_sigma < 1e-9 {
+                        i += 1;
+                        continue;
+                    }
+                    // Argmax of `cp_probs` (posterior P(r_t = 0)) over
+                    // the cooldown lookback. This is BOCPD's MAP estimate
+                    // of the actual CP step -- generally earlier than the
+                    // MAP-drop trigger, by a detection-lag amount that
+                    // varies across CPs. Existing `detect()` uses the
+                    // same slice's max value for `confidence`; we use
+                    // its argmax position as the score's reference.
+                    let window_start = i - look_back;
+                    let mut peak_idx = i;
+                    let mut peak_val = cp_probs[i];
+                    // Strict `>` biases ties toward `i` (score = 0).
+                    // `>=` would favour the earliest matching step
+                    // and push more mass into positive scores -- see
+                    // the discrete-score over-coverage note in the
+                    // 0.12.0 CHANGELOG entry for ConformalCpWrapper.
+                    for (k, &p) in cp_probs
+                        .iter()
+                        .enumerate()
+                        .take(i + 1)
+                        .skip(window_start)
+                    {
+                        if p > peak_val {
+                            peak_val = p;
+                            peak_idx = k;
+                        }
+                    }
+                    let score = (i - peak_idx) as f64;
+
+                    last_detection = i;
+                    result.push((
+                        ChangePoint {
+                            index: original_indices[i],
+                            confidence,
+                            shift_sigma,
+                        },
+                        score,
+                    ));
+                    i += cooldown;
+                    continue;
+                }
+            }
+            i += 1;
+        }
+        result
+    }
+
     /// Run BOCPD with a Viterbi-style backward decode for change-point
     /// extraction.
     ///
@@ -978,6 +1167,12 @@ impl<P: Predictive> BocpdDetector<P> {
             i += 1;
         }
         result
+    }
+}
+
+impl<P: Predictive> ScoredDetect for BocpdDetector<P> {
+    fn detect_with_score(&self, data: &[f64]) -> Vec<(ChangePoint, f64)> {
+        BocpdDetector::detect_with_score(self, data)
     }
 }
 

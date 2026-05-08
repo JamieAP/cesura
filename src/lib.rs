@@ -27,6 +27,7 @@ pub mod auto_beta;
 pub mod auto_q0;
 #[cfg(feature = "joint-detection")]
 pub mod chen_wu;
+pub mod conformal;
 pub mod detrend;
 pub mod ensemble;
 #[cfg(any(test, feature = "test-utils"))]
@@ -44,6 +45,7 @@ mod math;
 mod nig;
 
 pub use bocpd::BocpdDetector;
+pub use conformal::{ConformalCp, ConformalCpWrapper, ScoredDetect};
 pub use ensemble::EnsembleDetector;
 pub use nig::Nig;
 pub use nig_ar1::NigAr1;
