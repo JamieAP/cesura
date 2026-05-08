@@ -68,24 +68,6 @@ pub struct MultiStreamChangePoint {
 }
 
 impl ScoreKind {
-    /// Analytic score → p-value mapping. **Currently unused** -- HC
-    /// uses rank-transform p-values (empirical CDF) which are robust
-    /// to score-kind misspecification. Retained as a reference
-    /// calibration for users who want analytic mappings; may be wired
-    /// into a future HC variant that uses a fixed reference distribution
-    /// instead of a sliding window.
-    #[allow(dead_code)]
-    pub(crate) fn to_pvalue(self, score: f64) -> f64 {
-        let raw = match self {
-            // Vovk/Sellke approximate Bayes-factor-to-p-value:
-            // p = 1 / (1 + BF). Conservative; bounded above by 1.
-            ScoreKind::BayesFactor => 1.0 / (1.0 + score.max(0.0)),
-            // cp_probs ∈ [0, 1] already; complement is the p-value.
-            ScoreKind::CpProbability => (1.0 - score).max(0.0),
-        };
-        raw.clamp(1e-12, 1.0)
-    }
-
     /// Default neutral reference for sum-CUSUM: the score level where
     /// evidence is approximately balanced. Per-step contribution is
     /// `score - neutral_reference`; cumulative sum reset on negative.
@@ -110,30 +92,6 @@ impl ScoreKind {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn pvalue_mapping_bf_monotone_decreasing() {
-        let p_low = ScoreKind::BayesFactor.to_pvalue(0.5);
-        let p_mid = ScoreKind::BayesFactor.to_pvalue(2.0);
-        let p_high = ScoreKind::BayesFactor.to_pvalue(10.0);
-        assert!(p_low > p_mid, "p({}) ≤ p({})", 0.5, 2.0);
-        assert!(p_mid > p_high, "p({}) ≤ p({})", 2.0, 10.0);
-    }
-
-    #[test]
-    fn pvalue_mapping_cp_monotone_decreasing() {
-        let p_low = ScoreKind::CpProbability.to_pvalue(0.05);
-        let p_high = ScoreKind::CpProbability.to_pvalue(0.95);
-        assert!(p_low > p_high);
-    }
-
-    #[test]
-    fn pvalue_mapping_floor_avoids_zero() {
-        let p = ScoreKind::CpProbability.to_pvalue(1.0);
-        assert!(p >= 1e-12, "p must be ≥ ε floor, got {p}");
-        let p = ScoreKind::BayesFactor.to_pvalue(f64::INFINITY);
-        assert!(p >= 1e-12);
-    }
 
     #[test]
     fn neutral_reference_per_kind() {
