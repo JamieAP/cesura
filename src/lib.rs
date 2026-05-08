@@ -28,6 +28,7 @@ pub mod auto_q0;
 #[cfg(feature = "joint-detection")]
 pub mod chen_wu;
 pub mod detrend;
+pub mod ensemble;
 #[cfg(any(test, feature = "test-utils"))]
 pub mod eval;
 pub mod focus;
@@ -41,6 +42,7 @@ mod math;
 mod nig;
 
 pub use bocpd::BocpdDetector;
+pub use ensemble::EnsembleDetector;
 pub(crate) use math::{lgamma, log_add_exp};
 pub(crate) use nig::Nig;
 

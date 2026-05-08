@@ -7,8 +7,12 @@
 //!
 //! Run with: `cargo test --features test-utils --test statistical`.
 
+use cesura::detrend::{dominant_period_via_acf, Detrender};
 use cesura::eval::{self, Category, Rng};
-use cesura::BocpdDetector;
+use cesura::{BocpdDetector, EnsembleDetector};
+
+#[cfg(feature = "joint-detection")]
+use cesura::chen_wu::{ChenWuDetector, Detection};
 
 // ── ARL₀: average run length to false alarm under H0 ─────────────────
 
@@ -282,6 +286,1127 @@ fn bocpd_matches_or_beats_cusum_aggregate() {
         "FOCuS aggregate F1 {:.3} below sanity floor 0.10 -- broken?",
         f_agg.f1
     );
+}
+
+// ── Ensemble-vote probe ──────────────────────────────────────────────
+//
+// Hypothesis: BOCPD and FOCuS have largely independent failure modes.
+// BOCPD's MAP-drop heuristic is permissive -- low precision on
+// MustReject scenarios. FOCuS's frequentist GLR is cleaner on
+// stationary noise but misses subtle shifts -- low recall on
+// Challenging scenarios. An agreement-based ensemble should lift
+// aggregate F1 above either alone.
+//
+// Probe four rules:
+// - bocpd-alone (baseline)
+// - focus-alone (baseline)
+// - and-vote: keep a BOCPD CP only if FOCuS fires within ±tol
+// - confident-or-confirmed: keep BOCPD CPs that are either
+//   high-confidence (>= conf_floor) OR confirmed by FOCuS within ±tol
+//
+// Informational test: prints per-rule aggregate metrics and per-
+// category breakdown. Asserts only the soft floor that the best
+// ensemble does not regress vs BOCPD alone (within 1pp of equality);
+// a stricter assertion would over-fit to the current scenario suite.
+fn and_vote(bocpd: &[usize], focus: &[usize], tol: i64) -> Vec<usize> {
+    bocpd
+        .iter()
+        .copied()
+        .filter(|&b| focus.iter().any(|&f| (f as i64 - b as i64).abs() <= tol))
+        .collect()
+}
+
+fn confident_or_confirmed(
+    bocpd_cps: &[(usize, f64)],
+    focus: &[usize],
+    tol: i64,
+    conf_floor: f64,
+) -> Vec<usize> {
+    bocpd_cps
+        .iter()
+        .filter_map(|&(idx, conf)| {
+            let confirmed = focus.iter().any(|&f| (f as i64 - idx as i64).abs() <= tol);
+            if conf >= conf_floor || confirmed {
+                Some(idx)
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+#[test]
+fn ensemble_vote_aggregate_probe() {
+    let scenarios = eval::all_scenarios();
+    let det = BocpdDetector::new(200.0, 400);
+    let tol_steps: i64 = 15; // detection-agreement window
+    let conf_floor = 0.5_f64; // BOCPD confidence threshold for solo-trust
+
+    let mut by_rule: std::collections::BTreeMap<&str, Vec<eval::EvalMetrics>> =
+        std::collections::BTreeMap::new();
+
+    for s in &scenarios {
+        let bocpd_cps = det.detect(&s.data);
+        let bocpd_idx: Vec<usize> = bocpd_cps.iter().map(|c| c.index).collect();
+        let bocpd_pairs: Vec<(usize, f64)> =
+            bocpd_cps.iter().map(|c| (c.index, c.confidence)).collect();
+        let focus_idx = eval::focus_detect(&s.data, 8.0);
+
+        let and_idx = and_vote(&bocpd_idx, &focus_idx, tol_steps);
+        let coc_idx = confident_or_confirmed(&bocpd_pairs, &focus_idx, tol_steps, conf_floor);
+
+        for (rule, idxs) in [
+            ("bocpd_alone", bocpd_idx.clone()),
+            ("focus_alone", focus_idx.clone()),
+            ("and_vote", and_idx),
+            ("confident_or_confirmed", coc_idx),
+        ] {
+            let mut m = eval::match_detections(&idxs, &s.ground_truth, 20);
+            m.name = s.name.to_string();
+            m.category = s.category;
+            by_rule.entry(rule).or_default().push(m);
+        }
+    }
+
+    eprintln!("\n=== Ensemble-vote probe (tol={tol_steps}, conf_floor={conf_floor}) ===");
+    eprintln!(
+        "{:<24} {:>6} {:>6} {:>6} {:>5} {:>5} {:>5}",
+        "Rule", "P", "R", "F1", "TP", "FP", "FN"
+    );
+    eprintln!("{}", "-".repeat(64));
+    let mut summary: Vec<(&str, eval::EvalMetrics)> = Vec::new();
+    for (rule, ms) in &by_rule {
+        let agg = eval::aggregate(ms);
+        eprintln!(
+            "{:<24} {:>6.3} {:>6.3} {:>6.3} {:>5} {:>5} {:>5}",
+            rule, agg.precision, agg.recall, agg.f1, agg.tp, agg.fp, agg.r#fn
+        );
+        summary.push((*rule, agg));
+    }
+
+    // Per-category breakdown for the two ensemble rules vs BOCPD baseline.
+    eprintln!("\n--- Per-category F1 ---");
+    eprintln!(
+        "{:<24} {:>6} {:>6} {:>6} {:>6} {:>6}",
+        "Rule", "MD", "MR_FP", "CH", "OP", "HT"
+    );
+    for (rule, ms) in &by_rule {
+        let f1_for = |cat: Category| -> f64 {
+            let filt: Vec<eval::EvalMetrics> =
+                ms.iter().filter(|m| m.category == cat).cloned().collect();
+            if filt.is_empty() {
+                0.0
+            } else {
+                eval::aggregate(&filt).f1
+            }
+        };
+        let mr_fp: usize = ms
+            .iter()
+            .filter(|m| m.category == Category::MustReject)
+            .map(|m| m.fp)
+            .sum();
+        eprintln!(
+            "{:<24} {:>6.3} {:>6} {:>6.3} {:>6.3} {:>6.3}",
+            rule,
+            f1_for(Category::MustDetect),
+            mr_fp,
+            f1_for(Category::Challenging),
+            f1_for(Category::Operational),
+            // Heavy-tail = MustDetect tag in our suite, but the names hint
+            f1_for(Category::MustDetect),
+        );
+    }
+
+    // Soft assertion: at least one ensemble rule should not regress
+    // BOCPD-alone aggregate F1 by more than 1pp. If both regress, the
+    // simple-vote hypothesis is dead and we need a different approach.
+    let bocpd_f1 = summary
+        .iter()
+        .find(|(r, _)| *r == "bocpd_alone")
+        .unwrap()
+        .1
+        .f1;
+    let best_ensemble_f1 = summary
+        .iter()
+        .filter(|(r, _)| *r == "and_vote" || *r == "confident_or_confirmed")
+        .map(|(_, m)| m.f1)
+        .fold(0.0_f64, f64::max);
+    assert!(
+        best_ensemble_f1 >= bocpd_f1 - 0.01,
+        "best ensemble F1 {best_ensemble_f1:.3} regresses BOCPD-alone {bocpd_f1:.3} by >1pp -- simple vote not viable"
+    );
+}
+
+#[test]
+fn ensemble_aggregate_meets_floor() {
+    let scenarios = eval::all_scenarios();
+    let det = EnsembleDetector::new(200.0, 400);
+
+    let mut metrics = Vec::new();
+    for s in &scenarios {
+        let idx: Vec<usize> = det.detect(&s.data).iter().map(|c| c.index).collect();
+        let mut m = eval::match_detections(&idx, &s.ground_truth, 20);
+        m.name = s.name.to_string();
+        m.category = s.category;
+        metrics.push(m);
+    }
+    let agg = eval::aggregate(&metrics);
+
+    let bocpd_baseline = {
+        let det = BocpdDetector::new(200.0, 400);
+        let mut m = Vec::new();
+        for s in &scenarios {
+            let idx: Vec<usize> = det.detect(&s.data).iter().map(|c| c.index).collect();
+            let mut em = eval::match_detections(&idx, &s.ground_truth, 20);
+            em.name = s.name.to_string();
+            em.category = s.category;
+            m.push(em);
+        }
+        eval::aggregate(&m)
+    };
+
+    eprintln!("\n=== Ensemble vs BOCPD (regression pin) ===");
+    eprintln!(
+        "BOCPD-alone     F1={:.3}  P={:.3}  R={:.3}  TP={} FP={} FN={}",
+        bocpd_baseline.f1,
+        bocpd_baseline.precision,
+        bocpd_baseline.recall,
+        bocpd_baseline.tp,
+        bocpd_baseline.fp,
+        bocpd_baseline.r#fn
+    );
+    eprintln!(
+        "Ensemble (COC)  F1={:.3}  P={:.3}  R={:.3}  TP={} FP={} FN={}",
+        agg.f1, agg.precision, agg.recall, agg.tp, agg.fp, agg.r#fn
+    );
+
+    assert!(
+        agg.f1 >= 0.595,
+        "ensemble aggregate F1 {:.3} regressed below pinned floor 0.595",
+        agg.f1
+    );
+    assert!(
+        agg.f1 >= bocpd_baseline.f1 - 0.005,
+        "ensemble F1 {:.3} regressed below BOCPD baseline {:.3} by >0.5pp",
+        agg.f1,
+        bocpd_baseline.f1
+    );
+    let mr_fp: usize = metrics
+        .iter()
+        .filter(|m| m.category == Category::MustReject)
+        .map(|m| m.fp)
+        .sum();
+    let bocpd_mr_fp: usize = {
+        let det = BocpdDetector::new(200.0, 400);
+        scenarios
+            .iter()
+            .filter(|s| s.category == Category::MustReject)
+            .map(|s| {
+                let idx: Vec<usize> = det.detect(&s.data).iter().map(|c| c.index).collect();
+                eval::match_detections(&idx, &s.ground_truth, 20).fp
+            })
+            .sum()
+    };
+    eprintln!("MustReject FPs:  BOCPD={bocpd_mr_fp}    Ensemble={mr_fp}");
+    assert!(
+        mr_fp <= bocpd_mr_fp,
+        "ensemble must not have more MustReject FPs than BOCPD baseline; \
+         got ensemble={mr_fp} vs BOCPD={bocpd_mr_fp}"
+    );
+}
+
+#[test]
+fn ensemble_vote_grid_probe() {
+    // Sweep tolerance and confidence-floor to find the best
+    // operating point of the confident-or-confirmed rule. Also tries
+    // a strict-AND with relaxed tolerance to see if FOCuS just needs
+    // a wider matching window.
+    let scenarios = eval::all_scenarios();
+    let det = BocpdDetector::new(200.0, 400);
+
+    let tolerances: [i64; 4] = [10, 15, 25, 40];
+    let conf_floors: [f64; 5] = [0.0, 0.3, 0.4, 0.5, 0.7];
+
+    eprintln!("\n=== Ensemble-vote grid probe ===");
+    eprintln!(
+        "{:<6} {:>4} {:>5}   {:<5} {:<5} {:<5}    {:<5} {:<5} {:<5}",
+        "rule", "tol", "conf", "P", "R", "F1", "MD", "MR-FP", "OP"
+    );
+    eprintln!("{}", "-".repeat(70));
+
+    let mut best_f1 = 0.0_f64;
+    let mut best_label = String::new();
+
+    for &tol in &tolerances {
+        let mut and_metrics = Vec::new();
+        for s in &scenarios {
+            let bocpd_idx: Vec<usize> = det.detect(&s.data).iter().map(|c| c.index).collect();
+            let focus_idx = eval::focus_detect(&s.data, 8.0);
+            let idxs = and_vote(&bocpd_idx, &focus_idx, tol);
+            let mut m = eval::match_detections(&idxs, &s.ground_truth, 20);
+            m.name = s.name.to_string();
+            m.category = s.category;
+            and_metrics.push(m);
+        }
+        let agg = eval::aggregate(&and_metrics);
+        let md_f1 = eval::aggregate(
+            &and_metrics
+                .iter()
+                .filter(|m| m.category == Category::MustDetect)
+                .cloned()
+                .collect::<Vec<_>>(),
+        )
+        .f1;
+        let mr_fp: usize = and_metrics
+            .iter()
+            .filter(|m| m.category == Category::MustReject)
+            .map(|m| m.fp)
+            .sum();
+        let op_f1 = eval::aggregate(
+            &and_metrics
+                .iter()
+                .filter(|m| m.category == Category::Operational)
+                .cloned()
+                .collect::<Vec<_>>(),
+        )
+        .f1;
+        eprintln!(
+            "{:<6} {:>4} {:>5}   {:>5.3} {:>5.3} {:>5.3}    {:>5.3} {:>5} {:>5.3}",
+            "AND", tol, "-", agg.precision, agg.recall, agg.f1, md_f1, mr_fp, op_f1
+        );
+        if agg.f1 > best_f1 {
+            best_f1 = agg.f1;
+            best_label = format!("AND tol={tol}");
+        }
+
+        for &cf in &conf_floors {
+            let mut coc_metrics = Vec::new();
+            for s in &scenarios {
+                let bocpd_cps: Vec<(usize, f64)> = det
+                    .detect(&s.data)
+                    .into_iter()
+                    .map(|c| (c.index, c.confidence))
+                    .collect();
+                let focus_idx = eval::focus_detect(&s.data, 8.0);
+                let idxs = confident_or_confirmed(&bocpd_cps, &focus_idx, tol, cf);
+                let mut m = eval::match_detections(&idxs, &s.ground_truth, 20);
+                m.name = s.name.to_string();
+                m.category = s.category;
+                coc_metrics.push(m);
+            }
+            let agg = eval::aggregate(&coc_metrics);
+            let md_f1 = eval::aggregate(
+                &coc_metrics
+                    .iter()
+                    .filter(|m| m.category == Category::MustDetect)
+                    .cloned()
+                    .collect::<Vec<_>>(),
+            )
+            .f1;
+            let mr_fp: usize = coc_metrics
+                .iter()
+                .filter(|m| m.category == Category::MustReject)
+                .map(|m| m.fp)
+                .sum();
+            let op_f1 = eval::aggregate(
+                &coc_metrics
+                    .iter()
+                    .filter(|m| m.category == Category::Operational)
+                    .cloned()
+                    .collect::<Vec<_>>(),
+            )
+            .f1;
+            eprintln!(
+                "{:<6} {:>4} {:>5.2}   {:>5.3} {:>5.3} {:>5.3}    {:>5.3} {:>5} {:>5.3}",
+                "COC", tol, cf, agg.precision, agg.recall, agg.f1, md_f1, mr_fp, op_f1
+            );
+            if agg.f1 > best_f1 {
+                best_f1 = agg.f1;
+                best_label = format!("COC tol={tol} cf={cf:.2}");
+            }
+        }
+    }
+
+    eprintln!("\nBEST: {best_label} → F1 = {best_f1:.4}");
+    let baseline_f1 = {
+        let mut b = Vec::new();
+        for s in &scenarios {
+            let idx: Vec<usize> = det.detect(&s.data).iter().map(|c| c.index).collect();
+            let mut m = eval::match_detections(&idx, &s.ground_truth, 20);
+            m.name = s.name.to_string();
+            m.category = s.category;
+            b.push(m);
+        }
+        eval::aggregate(&b).f1
+    };
+    eprintln!("BOCPD-alone baseline F1 = {baseline_f1:.4}");
+    eprintln!("DELTA = {:+.4}", best_f1 - baseline_f1);
+}
+
+// ── 3-way ensemble probe ─────────────────────────────────────────────
+//
+// Extend the 2-way (BOCPD + FOCuS) comparison with Chen & Wu's
+// CP emissions as a third confirmation arm. Hypothesis: Chen & Wu
+// (Bayesian, anomaly-aware) catches the same regime shifts BOCPD
+// catches but rejects collective anomalies BOCPD treats as CPs --
+// that anomaly-rejection is precisely the signal a confirmation arm
+// adds. Two rules tested:
+//
+//   - AND-3:  BOCPD ∧ FOCuS ∧ ChenWu        (strict, max precision)
+//   - COC3:   conf >= floor                  (high-conf passthrough)
+//             ∨ FOCuS confirms within tol
+//             ∨ ChenWu CP confirms within tol  (loose-OR confirmation)
+//
+#[cfg(feature = "joint-detection")]
+#[test]
+fn ensemble_three_way_probe() {
+    let scenarios = eval::all_scenarios();
+    let det = BocpdDetector::new(200.0, 400);
+    let chen = ChenWuDetector::new(0.1, 0.2, 4, 0.5, 0.5);
+
+    let tol: i64 = 25;
+    let cf = 0.40_f64;
+
+    eprintln!("\n=== 3-way ensemble probe (tol={tol}, cf={cf}) ===");
+    eprintln!(
+        "{:<24} {:>5} {:>5} {:>5}  {:>5} {:>5}",
+        "Rule", "P", "R", "F1", "MR_FP", "OP"
+    );
+    eprintln!("{}", "-".repeat(60));
+
+    let collect_for = |rule_idxs: Vec<Vec<usize>>| -> Vec<eval::EvalMetrics> {
+        scenarios
+            .iter()
+            .zip(rule_idxs)
+            .map(|(s, idxs)| {
+                let mut m = eval::match_detections(&idxs, &s.ground_truth, 20);
+                m.name = s.name.to_string();
+                m.category = s.category;
+                m
+            })
+            .collect()
+    };
+    let summarise = |label: &str, ms: &[eval::EvalMetrics]| {
+        let agg = eval::aggregate(ms);
+        let mr_fp: usize = ms
+            .iter()
+            .filter(|m| m.category == Category::MustReject)
+            .map(|m| m.fp)
+            .sum();
+        let op_f1 = eval::aggregate(
+            &ms.iter()
+                .filter(|m| m.category == Category::Operational)
+                .cloned()
+                .collect::<Vec<_>>(),
+        )
+        .f1;
+        eprintln!(
+            "{:<24} {:>5.3} {:>5.3} {:>5.3}  {:>5} {:>5.3}",
+            label, agg.precision, agg.recall, agg.f1, mr_fp, op_f1
+        );
+        agg.f1
+    };
+
+    // Per-scenario detector outputs (computed once, reused per rule).
+    let bocpd_per_scenario: Vec<Vec<(usize, f64)>> = scenarios
+        .iter()
+        .map(|s| {
+            det.detect(&s.data)
+                .into_iter()
+                .map(|c| (c.index, c.confidence))
+                .collect()
+        })
+        .collect();
+    let focus_per_scenario: Vec<Vec<usize>> = scenarios
+        .iter()
+        .map(|s| eval::focus_detect(&s.data, 8.0))
+        .collect();
+    let chen_per_scenario: Vec<Vec<usize>> = scenarios
+        .iter()
+        .map(|s| {
+            chen.detect(&s.data)
+                .into_iter()
+                .filter_map(|d| match d {
+                    Detection::ChangePoint(cp) => Some(cp.index),
+                    Detection::CollectiveAnomaly { .. } => None,
+                })
+                .collect()
+        })
+        .collect();
+
+    let bocpd_only: Vec<Vec<usize>> = bocpd_per_scenario
+        .iter()
+        .map(|v| v.iter().map(|&(i, _)| i).collect())
+        .collect();
+    let coc2: Vec<Vec<usize>> = bocpd_per_scenario
+        .iter()
+        .zip(&focus_per_scenario)
+        .map(|(b, f)| {
+            b.iter()
+                .filter_map(|&(i, c)| {
+                    let confirmed = f.iter().any(|&fi| (fi as i64 - i as i64).abs() <= tol);
+                    (c >= cf || confirmed).then_some(i)
+                })
+                .collect()
+        })
+        .collect();
+    let f_bocpd = summarise("bocpd_alone", &collect_for(bocpd_only.clone()));
+    let f_coc2 = summarise("coc2 (B+F)", &collect_for(coc2.clone()));
+
+    // ChenWu-only.
+    let chen_only: Vec<Vec<usize>> = chen_per_scenario.clone();
+    let _ = summarise("chenwu_alone", &collect_for(chen_only));
+
+    // AND-3: BOCPD ∧ FOCuS ∧ ChenWu.
+    let and3: Vec<Vec<usize>> = bocpd_per_scenario
+        .iter()
+        .zip(&focus_per_scenario)
+        .zip(&chen_per_scenario)
+        .map(|((b, f), c)| {
+            b.iter()
+                .filter_map(|&(i, _)| {
+                    let f_ok = f.iter().any(|&fi| (fi as i64 - i as i64).abs() <= tol);
+                    let c_ok = c.iter().any(|&ci| (ci as i64 - i as i64).abs() <= tol);
+                    (f_ok && c_ok).then_some(i)
+                })
+                .collect()
+        })
+        .collect();
+    let f_and3 = summarise("and3 (B∧F∧C)", &collect_for(and3));
+
+    // COC3: high-conf OR (FOCuS confirms) OR (ChenWu confirms).
+    let coc3: Vec<Vec<usize>> = bocpd_per_scenario
+        .iter()
+        .zip(&focus_per_scenario)
+        .zip(&chen_per_scenario)
+        .map(|((b, f), c)| {
+            b.iter()
+                .filter_map(|&(i, conf)| {
+                    if conf >= cf {
+                        return Some(i);
+                    }
+                    let f_ok = f.iter().any(|&fi| (fi as i64 - i as i64).abs() <= tol);
+                    let c_ok = c.iter().any(|&ci| (ci as i64 - i as i64).abs() <= tol);
+                    (f_ok || c_ok).then_some(i)
+                })
+                .collect()
+        })
+        .collect();
+    let f_coc3 = summarise("coc3 (loose-OR)", &collect_for(coc3));
+
+    // COC3-AND: high-conf OR (FOCuS AND ChenWu confirm).
+    let coc3_and: Vec<Vec<usize>> = bocpd_per_scenario
+        .iter()
+        .zip(&focus_per_scenario)
+        .zip(&chen_per_scenario)
+        .map(|((b, f), c)| {
+            b.iter()
+                .filter_map(|&(i, conf)| {
+                    if conf >= cf {
+                        return Some(i);
+                    }
+                    let f_ok = f.iter().any(|&fi| (fi as i64 - i as i64).abs() <= tol);
+                    let c_ok = c.iter().any(|&ci| (ci as i64 - i as i64).abs() <= tol);
+                    (f_ok && c_ok).then_some(i)
+                })
+                .collect()
+        })
+        .collect();
+    let f_coc3_and = summarise("coc3-and (B|FAND C)", &collect_for(coc3_and));
+
+    eprintln!(
+        "\nDeltas vs BOCPD-alone ({:.3}):  COC2 {:+.4}  AND3 {:+.4}  COC3 {:+.4}  COC3-AND {:+.4}",
+        f_bocpd,
+        f_coc2 - f_bocpd,
+        f_and3 - f_bocpd,
+        f_coc3 - f_bocpd,
+        f_coc3_and - f_bocpd
+    );
+    eprintln!(
+        "Deltas vs COC2 ({:.3}):           AND3 {:+.4}  COC3 {:+.4}  COC3-AND {:+.4}",
+        f_coc2,
+        f_and3 - f_coc2,
+        f_coc3 - f_coc2,
+        f_coc3_and - f_coc2
+    );
+}
+
+///
+/// Three modes:
+/// - raw: BOCPD on raw data (current default, baseline)
+/// - autodetrend: if `dominant_period_via_acf` returns Some, fit
+///   `Detrender` and run BOCPD on `detrend_diff`. Else fall back to raw.
+/// - always_diff: force `seasonal_difference(period=ACF or 24)`
+///   regardless of ACF strength. Diagnostic only.
+#[test]
+fn detrending_integration_probe() {
+    let scenarios = eval::all_scenarios();
+    let det = BocpdDetector::new(200.0, 400);
+    let tolerance = 20_usize;
+
+    let detect_raw = |s: &eval::Scenario| -> Vec<usize> {
+        det.detect(&s.data).iter().map(|c| c.index).collect()
+    };
+
+    let detect_autodetrend = |s: &eval::Scenario| -> (Vec<usize>, Option<usize>) {
+        // Try seasonal differencing if a clear period is detected. The
+        // mapping from differenced indices back to original space is a
+        // shift by `period` (since `seasonal_difference` drops the first
+        // P values).
+        let period_opt = dominant_period_via_acf(&s.data);
+        match period_opt {
+            Some(p) if p > 0 && p < s.data.len() / 4 => {
+                let diffed = cesura::detrend::seasonal_difference(&s.data, p);
+                let cps_in_diffed: Vec<usize> =
+                    det.detect(&diffed).iter().map(|c| c.index).collect();
+                let cps_in_orig = cps_in_diffed.into_iter().map(|i| i + p).collect();
+                (cps_in_orig, Some(p))
+            }
+            _ => (detect_raw(s), None),
+        }
+    };
+
+    let mut metrics_raw = Vec::new();
+    let mut metrics_auto = Vec::new();
+    eprintln!("\n=== Detrending integration probe ===");
+    eprintln!(
+        "{:<32} {:<6} {:>3} {:>3} {:>3}    {:<6} {:>3} {:>3} {:>3}",
+        "scenario", "raw", "TP", "FP", "FN", "auto", "TP", "FP", "FN"
+    );
+    eprintln!("{}", "-".repeat(90));
+    for s in &scenarios {
+        let raw_idx = detect_raw(s);
+        let (auto_idx, period) = detect_autodetrend(s);
+
+        let mut mr = eval::match_detections(&raw_idx, &s.ground_truth, tolerance);
+        mr.name = s.name.to_string();
+        mr.category = s.category;
+        let mut ma = eval::match_detections(&auto_idx, &s.ground_truth, tolerance);
+        ma.name = s.name.to_string();
+        ma.category = s.category;
+
+        let detrended_marker = period.map(|p| format!("p={p}")).unwrap_or_else(|| "-".into());
+        eprintln!(
+            "{:<32} {:<6} {:>3} {:>3} {:>3}    {:<6} {:>3} {:>3} {:>3}",
+            s.name,
+            "",
+            mr.tp,
+            mr.fp,
+            mr.r#fn,
+            detrended_marker,
+            ma.tp,
+            ma.fp,
+            ma.r#fn
+        );
+        metrics_raw.push(mr);
+        metrics_auto.push(ma);
+    }
+
+    let agg_raw = eval::aggregate(&metrics_raw);
+    let agg_auto = eval::aggregate(&metrics_auto);
+    eprintln!("{}", "-".repeat(90));
+    eprintln!(
+        "raw  AGG: F1={:.3} P={:.3} R={:.3} TP={} FP={} FN={}",
+        agg_raw.f1, agg_raw.precision, agg_raw.recall, agg_raw.tp, agg_raw.fp, agg_raw.r#fn
+    );
+    eprintln!(
+        "auto AGG: F1={:.3} P={:.3} R={:.3} TP={} FP={} FN={}",
+        agg_auto.f1, agg_auto.precision, agg_auto.recall, agg_auto.tp, agg_auto.fp, agg_auto.r#fn
+    );
+
+    let mr_raw: usize = metrics_raw
+        .iter()
+        .filter(|m| m.category == Category::MustReject)
+        .map(|m| m.fp)
+        .sum();
+    let mr_auto: usize = metrics_auto
+        .iter()
+        .filter(|m| m.category == Category::MustReject)
+        .map(|m| m.fp)
+        .sum();
+    eprintln!("MR_FP: raw={mr_raw}  auto={mr_auto}  delta={}", mr_raw as i64 - mr_auto as i64);
+
+    let _ = Detrender::auto_fit(&[0.0; 100]); // suppress unused-import warning
+}
+
+#[test]
+fn detrend_ensemble_meets_floor() {
+    let scenarios = eval::all_scenarios();
+    let det = EnsembleDetector::new(200.0, 400).with_auto_detrend(true);
+    let mut metrics = Vec::new();
+    for s in &scenarios {
+        let idx: Vec<usize> = det.detect(&s.data).iter().map(|c| c.index).collect();
+        let mut m = eval::match_detections(&idx, &s.ground_truth, 20);
+        m.name = s.name.to_string();
+        m.category = s.category;
+        metrics.push(m);
+    }
+    let agg = eval::aggregate(&metrics);
+    let mr_fp: usize = metrics
+        .iter()
+        .filter(|m| m.category == Category::MustReject)
+        .map(|m| m.fp)
+        .sum();
+    eprintln!(
+        "detrend+ensemble  F1={:.3}  P={:.3}  R={:.3}  MR_FP={}",
+        agg.f1, agg.precision, agg.recall, mr_fp
+    );
+    assert!(
+        agg.f1 >= 0.620,
+        "detrend+ensemble F1 {:.3} regressed below pinned floor 0.620",
+        agg.f1
+    );
+    assert!(
+        mr_fp <= 14,
+        "detrend+ensemble MR_FP {mr_fp} regressed above pinned ceiling 14"
+    );
+    assert!(
+        agg.recall >= 0.720,
+        "detrend+ensemble recall {:.3} regressed below pinned floor 0.720",
+        agg.recall
+    );
+}
+
+/// Iter-6 follow-on: compose detrending + COC2 ensemble. If both
+/// levers move the dial independently, applying both should compound.
+#[test]
+fn detrend_plus_ensemble_probe() {
+    let scenarios = eval::all_scenarios();
+    let det = BocpdDetector::new(200.0, 400);
+    let ens = EnsembleDetector::new(200.0, 400);
+    let tolerance = 20_usize;
+
+    let mut metrics_raw_bocpd = Vec::new();
+    let mut metrics_raw_ens = Vec::new();
+    let mut metrics_diff_bocpd = Vec::new();
+    let mut metrics_diff_ens = Vec::new();
+
+    for s in &scenarios {
+        let raw_idx_bocpd: Vec<usize> =
+            det.detect(&s.data).iter().map(|c| c.index).collect();
+        let raw_idx_ens: Vec<usize> = ens.detect(&s.data).iter().map(|c| c.index).collect();
+
+        let detrended_data: Vec<f64> = match dominant_period_via_acf(&s.data) {
+            Some(p) if p > 0 && p < s.data.len() / 4 => {
+                cesura::detrend::seasonal_difference(&s.data, p)
+            }
+            _ => s.data.clone(),
+        };
+        let shift = s.data.len() - detrended_data.len();
+        let diff_idx_bocpd: Vec<usize> = det
+            .detect(&detrended_data)
+            .iter()
+            .map(|c| c.index + shift)
+            .collect();
+        let diff_idx_ens: Vec<usize> = ens
+            .detect(&detrended_data)
+            .iter()
+            .map(|c| c.index + shift)
+            .collect();
+
+        for (idxs, target) in [
+            (raw_idx_bocpd, &mut metrics_raw_bocpd),
+            (raw_idx_ens, &mut metrics_raw_ens),
+            (diff_idx_bocpd, &mut metrics_diff_bocpd),
+            (diff_idx_ens, &mut metrics_diff_ens),
+        ] {
+            let mut m = eval::match_detections(&idxs, &s.ground_truth, tolerance);
+            m.name = s.name.to_string();
+            m.category = s.category;
+            target.push(m);
+        }
+    }
+
+    eprintln!("\n=== Detrending × Ensemble matrix ===");
+    for (label, ms) in [
+        ("raw + BOCPD     ", &metrics_raw_bocpd),
+        ("raw + Ensemble  ", &metrics_raw_ens),
+        ("detrend + BOCPD ", &metrics_diff_bocpd),
+        ("detrend + Ens   ", &metrics_diff_ens),
+    ] {
+        let agg = eval::aggregate(ms);
+        let mr_fp: usize = ms
+            .iter()
+            .filter(|m| m.category == Category::MustReject)
+            .map(|m| m.fp)
+            .sum();
+        eprintln!(
+            "{:<18}  F1={:.3}  P={:.3}  R={:.3}  TP={} FP={} FN={}  MR_FP={}",
+            label, agg.f1, agg.precision, agg.recall, agg.tp, agg.fp, agg.r#fn, mr_fp
+        );
+    }
+}
+
+#[test]
+fn alt_confidence_summary_calibration_probe() {
+    let scenarios = eval::all_scenarios();
+    let det = BocpdDetector::new(200.0, 400);
+    let tolerance = 20_usize;
+    let cooldown = 15_usize;
+
+    fn build_summary<F: Fn(&[f64]) -> f64>(
+        cp_probs: &[f64],
+        trigger: usize,
+        cooldown: usize,
+        f: F,
+    ) -> f64 {
+        let lo = trigger.saturating_sub(cooldown);
+        let win = &cp_probs[lo..=trigger.min(cp_probs.len() - 1)];
+        f(win).clamp(0.0, 1.0)
+    }
+
+    // For each scenario, iterate over its detected CPs and compute every
+    // candidate summary. Keep (summary_value, is_tp) for binning.
+    let mut by_summary: std::collections::BTreeMap<&str, Vec<(f64, bool)>> =
+        std::collections::BTreeMap::new();
+
+    for s in &scenarios {
+        let (cps, cp_probs, original_indices) = det.detect_with_cp_probs(&s.data);
+        // Map original->filter
+        let orig_to_filt: std::collections::HashMap<usize, usize> = original_indices
+            .iter()
+            .enumerate()
+            .map(|(i, &orig)| (orig, i))
+            .collect();
+
+        // Greedy nearest-first matching mirrors `match_detections`.
+        let mut matched_gt = vec![false; s.ground_truth.len()];
+        let mut idxd: Vec<(usize, &cesura::ChangePoint)> = cps.iter().enumerate().collect();
+        idxd.sort_by_key(|(_, cp)| {
+            s.ground_truth
+                .iter()
+                .map(|&gt| (cp.index as i64 - gt as i64).unsigned_abs() as usize)
+                .min()
+                .unwrap_or(usize::MAX)
+        });
+        let mut tp_flags = vec![false; cps.len()];
+        for (orig_idx, cp) in idxd {
+            let mut best_dist = usize::MAX;
+            let mut best_gt = None;
+            for (gi, &gt) in s.ground_truth.iter().enumerate() {
+                if matched_gt[gi] {
+                    continue;
+                }
+                let d = (cp.index as i64 - gt as i64).unsigned_abs() as usize;
+                if d <= tolerance && d < best_dist {
+                    best_dist = d;
+                    best_gt = Some(gi);
+                }
+            }
+            if let Some(gi) = best_gt {
+                matched_gt[gi] = true;
+                tp_flags[orig_idx] = true;
+            }
+        }
+
+        for (cp, &tp) in cps.iter().zip(&tp_flags) {
+            let trig = match orig_to_filt.get(&cp.index) {
+                Some(&t) => t,
+                None => continue,
+            };
+
+            let peak = build_summary(&cp_probs, trig, cooldown, |w| {
+                w.iter().copied().fold(0.0_f64, f64::max)
+            });
+            let mean = build_summary(&cp_probs, trig, cooldown, |w| {
+                if w.is_empty() {
+                    0.0
+                } else {
+                    w.iter().sum::<f64>() / w.len() as f64
+                }
+            });
+            let area = build_summary(&cp_probs, trig, cooldown, |w| {
+                w.iter().sum::<f64>() / (cooldown + 1) as f64
+            });
+            let frac_above_5 = build_summary(&cp_probs, trig, cooldown, |w| {
+                w.iter().filter(|&&v| v >= 0.5).count() as f64 / w.len().max(1) as f64
+            });
+            let peak_x_mean = (peak * mean).sqrt();
+            let sustained = peak * frac_above_5;
+
+            by_summary.entry("peak").or_default().push((peak, tp));
+            by_summary.entry("mean").or_default().push((mean, tp));
+            by_summary.entry("area").or_default().push((area, tp));
+            by_summary
+                .entry("frac_above_0.5")
+                .or_default()
+                .push((frac_above_5, tp));
+            by_summary
+                .entry("sqrt(peak*mean)")
+                .or_default()
+                .push((peak_x_mean, tp));
+            by_summary
+                .entry("peak*frac_above_0.5")
+                .or_default()
+                .push((sustained, tp));
+        }
+    }
+
+    eprintln!("\n=== Alt confidence summary calibration ===");
+    let bins = [(0.0, 0.20), (0.20, 0.40), (0.40, 0.60), (0.60, 0.80), (0.80, 1.001)];
+    for (label, events) in &by_summary {
+        let n_total = events.len();
+        let tp_total = events.iter().filter(|(_, t)| *t).count();
+        eprintln!(
+            "\n--- {label} (n={n_total}, global prec {:.3}) ---",
+            tp_total as f64 / n_total.max(1) as f64
+        );
+        eprintln!("{:<14} {:>5} {:>5} {:>6}", "bin", "n", "tp", "prec");
+        let mut precs = Vec::new();
+        for &(lo, hi) in &bins {
+            let in_bin: Vec<&(f64, bool)> =
+                events.iter().filter(|(c, _)| *c >= lo && *c < hi).collect();
+            let n = in_bin.len();
+            let tp = in_bin.iter().filter(|(_, t)| *t).count();
+            let prec = if n == 0 {
+                f64::NAN
+            } else {
+                tp as f64 / n as f64
+            };
+            eprintln!(
+                "[{:>4.2},{:>4.2}) {:>5} {:>5} {:>6.3}",
+                lo, hi, n, tp, prec
+            );
+            if n > 0 {
+                precs.push(prec);
+            }
+        }
+        // Quick monotonicity check: count adjacent-bin increases.
+        let monotone = precs.windows(2).all(|w| w[1] >= w[0] - 1e-9);
+        eprintln!("monotone-non-decreasing? {monotone}");
+    }
+}
+
+/// Iter-4 sanity check on detect_viterbi: clean two-regime shift.
+/// One CP at index 100 in 200 samples. MAP-drop catches it; Viterbi
+/// must not return 0 or 50 CPs.
+#[test]
+fn viterbi_clean_shift_sanity() {
+    let mut data: Vec<f64> = (0..100).map(|_| 0.0).collect();
+    data.extend((0..100).map(|_| 5.0));
+    let det = BocpdDetector::new(200.0, 250);
+    let cps = det.detect_viterbi(&data);
+    eprintln!(
+        "viterbi clean-shift CPs: {:?}",
+        cps.iter().map(|c| c.index).collect::<Vec<_>>()
+    );
+    assert!(!cps.is_empty(), "expected at least one Viterbi CP");
+    assert!(
+        cps.iter().any(|c| (c.index as i64 - 100).abs() < 25),
+        "expected a Viterbi CP near index 100, got {:?}",
+        cps.iter().map(|c| c.index).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn mapdrop_intersect_viterbi_probe() {
+    let scenarios = eval::all_scenarios();
+    let det = BocpdDetector::new(200.0, 400);
+    let tol_steps: i64 = 25;
+    let tolerance = 20_usize;
+
+    let mut metrics = Vec::new();
+    for s in &scenarios {
+        let map_cps = det.detect(&s.data);
+        let vit_cps = det.detect_viterbi(&s.data);
+        let map_idx: Vec<usize> = map_cps.iter().map(|c| c.index).collect();
+        let vit_idx: Vec<usize> = vit_cps.iter().map(|c| c.index).collect();
+        // MAP-drop CP kept iff a Viterbi CP exists within ±tol_steps.
+        let confirmed: Vec<usize> = map_idx
+            .iter()
+            .copied()
+            .filter(|&m| vit_idx.iter().any(|&v| (v as i64 - m as i64).abs() <= tol_steps))
+            .collect();
+        let mut em = eval::match_detections(&confirmed, &s.ground_truth, tolerance);
+        em.name = s.name.to_string();
+        em.category = s.category;
+        metrics.push(em);
+    }
+    let agg = eval::aggregate(&metrics);
+    eprintln!(
+        "\nMAP-drop ∩ Viterbi  F1={:.3}  P={:.3}  R={:.3}  TP={} FP={} FN={}",
+        agg.f1, agg.precision, agg.recall, agg.tp, agg.fp, agg.r#fn
+    );
+    let mr_fp: usize = metrics
+        .iter()
+        .filter(|m| m.category == Category::MustReject)
+        .map(|m| m.fp)
+        .sum();
+    eprintln!("MR_FP = {mr_fp}");
+}
+
+#[test]
+fn viterbi_vs_mapdrop_aggregate() {
+    let scenarios = eval::all_scenarios();
+    let det = BocpdDetector::new(200.0, 400);
+    let tolerance = 20_usize;
+
+    let mut mapdrop_metrics = Vec::new();
+    let mut viterbi_metrics = Vec::new();
+    for s in &scenarios {
+        let map_idx: Vec<usize> = det.detect(&s.data).iter().map(|c| c.index).collect();
+        let vit_idx: Vec<usize> = det.detect_viterbi(&s.data).iter().map(|c| c.index).collect();
+        let mut mm = eval::match_detections(&map_idx, &s.ground_truth, tolerance);
+        mm.name = s.name.to_string();
+        mm.category = s.category;
+        mapdrop_metrics.push(mm);
+        let mut vm = eval::match_detections(&vit_idx, &s.ground_truth, tolerance);
+        vm.name = s.name.to_string();
+        vm.category = s.category;
+        viterbi_metrics.push(vm);
+    }
+
+    let mm = eval::aggregate(&mapdrop_metrics);
+    let vm = eval::aggregate(&viterbi_metrics);
+    eprintln!("\n=== MAP-drop vs Viterbi (aggregate) ===");
+    eprintln!(
+        "MAP-drop  F1={:.3}  P={:.3}  R={:.3}  TP={} FP={} FN={}",
+        mm.f1, mm.precision, mm.recall, mm.tp, mm.fp, mm.r#fn
+    );
+    eprintln!(
+        "Viterbi   F1={:.3}  P={:.3}  R={:.3}  TP={} FP={} FN={}",
+        vm.f1, vm.precision, vm.recall, vm.tp, vm.fp, vm.r#fn
+    );
+
+    // Per-category breakdown for the diagnostic.
+    eprintln!("\n--- Per-category F1 ---");
+    eprintln!("{:<6} {:>6} {:>6} {:>6} {:>6}", "rule", "MD", "MR_FP", "CH", "OP");
+    for (label, ms) in [("MAPdrp", &mapdrop_metrics), ("Vitrb", &viterbi_metrics)] {
+        let f1_for = |cat: Category| -> f64 {
+            let filt: Vec<eval::EvalMetrics> =
+                ms.iter().filter(|m| m.category == cat).cloned().collect();
+            if filt.is_empty() { 0.0 } else { eval::aggregate(&filt).f1 }
+        };
+        let mr_fp: usize = ms
+            .iter()
+            .filter(|m| m.category == Category::MustReject)
+            .map(|m| m.fp)
+            .sum();
+        eprintln!(
+            "{:<6} {:>6.3} {:>6} {:>6.3} {:>6.3}",
+            label,
+            f1_for(Category::MustDetect),
+            mr_fp,
+            f1_for(Category::Challenging),
+            f1_for(Category::Operational),
+        );
+    }
+}
+
+/// Iter-4 probe. The MAP-drop heuristic emits CPs with a `confidence`
+/// derived from `peak P(r_t = 0)` over the cooldown window. KNOWN_LIMITATIONS
+/// flags this as permissive; COMPARISON.md proposes a Viterbi backward
+/// pass for calibrated confidence. Before implementing Viterbi, ask: is
+/// the existing confidence already informative?
+///
+#[test]
+fn confidence_calibration_probe() {
+    let scenarios = eval::all_scenarios();
+    let det = BocpdDetector::new(200.0, 400);
+    let tolerance = 20_usize;
+
+    // Collect (confidence, is_tp) for every BOCPD detection across all
+    // scenarios. Greedy nearest-first matching mirrors `match_detections`
+    // so the binning is comparable to the aggregate F1 metric.
+    let mut events: Vec<(f64, bool)> = Vec::new();
+    for s in &scenarios {
+        let cps = det.detect(&s.data);
+        let mut matched_gt = vec![false; s.ground_truth.len()];
+        // Sort detected by distance to nearest GT (matches `match_detections`).
+        let mut idxd: Vec<(usize, &cesura::ChangePoint)> = cps.iter().enumerate().collect();
+        idxd.sort_by_key(|(_, cp)| {
+            s.ground_truth
+                .iter()
+                .map(|&gt| (cp.index as i64 - gt as i64).unsigned_abs() as usize)
+                .min()
+                .unwrap_or(usize::MAX)
+        });
+        let mut tp_flags = vec![false; cps.len()];
+        for (orig_idx, cp) in idxd {
+            let mut best_dist = usize::MAX;
+            let mut best_gt = None;
+            for (gi, &gt) in s.ground_truth.iter().enumerate() {
+                if matched_gt[gi] {
+                    continue;
+                }
+                let d = (cp.index as i64 - gt as i64).unsigned_abs() as usize;
+                if d <= tolerance && d < best_dist {
+                    best_dist = d;
+                    best_gt = Some(gi);
+                }
+            }
+            if let Some(gi) = best_gt {
+                matched_gt[gi] = true;
+                tp_flags[orig_idx] = true;
+            }
+        }
+        for (cp, &tp) in cps.iter().zip(&tp_flags) {
+            events.push((cp.confidence, tp));
+        }
+    }
+
+    eprintln!("\n=== Confidence calibration probe ===");
+    eprintln!("total detections: {}", events.len());
+    let total_tp = events.iter().filter(|(_, t)| *t).count();
+    eprintln!(
+        "global precision: {:.3} ({} TP / {})",
+        total_tp as f64 / events.len().max(1) as f64,
+        total_tp,
+        events.len()
+    );
+
+    let bins: [(f64, f64); 5] = [
+        (0.0, 0.20),
+        (0.20, 0.40),
+        (0.40, 0.60),
+        (0.60, 0.80),
+        (0.80, 1.001),
+    ];
+    eprintln!(
+        "\n{:<14} {:>5} {:>5} {:>6}",
+        "bin", "n", "tp", "prec"
+    );
+    eprintln!("{}", "-".repeat(34));
+    for &(lo, hi) in &bins {
+        let in_bin: Vec<&(f64, bool)> =
+            events.iter().filter(|(c, _)| *c >= lo && *c < hi).collect();
+        let n = in_bin.len();
+        let tp = in_bin.iter().filter(|(_, t)| *t).count();
+        let prec = if n == 0 {
+            f64::NAN
+        } else {
+            tp as f64 / n as f64
+        };
+        eprintln!(
+            "[{:>4.2},{:>4.2}) {:>5} {:>5} {:>6.3}",
+            lo, hi, n, tp, prec
+        );
+    }
+
+    // Cumulative-from-top: precision when filtering on conf >= floor.
+    eprintln!("\n--- Cumulative precision @ floor (post-hoc filter view) ---");
+    eprintln!(
+        "{:>6} {:>5} {:>5} {:>6} {:>6}",
+        "floor", "kept", "tp", "prec", "recall"
+    );
+    let total_gt: usize = scenarios.iter().map(|s| s.ground_truth.len()).sum();
+    let mut sorted = events.clone();
+    sorted.sort_by(|a, b| b.0.total_cmp(&a.0));
+    for floor in [0.0, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80] {
+        let kept: Vec<&(f64, bool)> = sorted.iter().filter(|(c, _)| *c >= floor).collect();
+        let n = kept.len();
+        let tp = kept.iter().filter(|(_, t)| *t).count();
+        let prec = if n == 0 {
+            f64::NAN
+        } else {
+            tp as f64 / n as f64
+        };
+        let recall = tp as f64 / total_gt.max(1) as f64;
+        eprintln!(
+            "{:>6.2} {:>5} {:>5} {:>6.3} {:>6.3}",
+            floor, n, tp, prec, recall
+        );
+    }
 }
 
 #[test]

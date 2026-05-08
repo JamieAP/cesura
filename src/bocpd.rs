@@ -413,6 +413,281 @@ impl BocpdDetector {
         result
     }
 
+    /// Diagnostic variant of [`detect`](Self::detect) that returns the
+    /// per-step posterior `P(r_t = 0)` array alongside the emitted
+    /// change points. Used by `tests/statistical.rs` confidence-
+    /// calibration probes to evaluate alternative summary statistics
+    /// (mean, area, sustained-peak) over the cooldown window without
+    /// re-running the forward pass.
+    ///
+    /// `cp_probs[i]` indexes the **post-NaN-filter** step; the third
+    /// return slot maps filtered indices back to original-data indices
+    /// so callers can match emitted CPs by `cp.index`.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn detect_with_cp_probs(&self, data: &[f64]) -> (Vec<ChangePoint>, Vec<f64>, Vec<usize>) {
+        let mut original_indices: Vec<usize> = Vec::new();
+        let data_filt: Vec<f64> = data
+            .iter()
+            .enumerate()
+            .filter_map(|(i, &v)| {
+                if v.is_finite() {
+                    original_indices.push(i);
+                    Some(v)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let cps = self.detect(data);
+        // Re-run a minimal forward pass to recover cp_probs. detect()
+        // computes this internally but doesn't surface it. Mirroring the
+        // recursion exactly keeps the array bit-for-bit identical to
+        // what detect() consumed.
+        let n = data_filt.len();
+        if n < 20 {
+            return (cps, vec![0.0; n], original_indices);
+        }
+        let mean = data_filt.iter().sum::<f64>() / n as f64;
+        let std = (data_filt.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / n as f64).sqrt();
+        let std = if std < 1e-10 { 1.0 } else { std };
+        let norm: Vec<f64> = data_filt.iter().map(|x| (x - mean) / std).collect();
+
+        let max_r = self.max_rl.min(n);
+        let mut rl_log = vec![f64::NEG_INFINITY; max_r + 1];
+        rl_log[0] = 0.0;
+        let mut stats = vec![self.prior.clone(); max_r + 1];
+        let beta = self.beta;
+        let mut cp_probs = Vec::with_capacity(n);
+        for &x in &norm {
+            let active = (n).min(max_r);
+            let mut new_rl = vec![f64::NEG_INFINITY; max_r + 1];
+            let mut prev_mass = f64::NEG_INFINITY;
+            for r in 0..=active.min(max_r.saturating_sub(1)) {
+                if rl_log[r] == f64::NEG_INFINITY {
+                    continue;
+                }
+                let pred = stats[r].log_predictive_robust(x, beta);
+                if !pred.is_finite() {
+                    continue;
+                }
+                if r < max_r {
+                    new_rl[r + 1] = log_add_exp(new_rl[r + 1], rl_log[r] + pred + self.growth_log);
+                }
+                prev_mass = log_add_exp(prev_mass, rl_log[r]);
+            }
+            let prior_pred = self.prior.log_predictive_robust(x, beta);
+            new_rl[0] = if prior_pred.is_finite() && prev_mass.is_finite() {
+                prev_mass + self.hazard_log + prior_pred
+            } else {
+                f64::NEG_INFINITY
+            };
+            let evidence = new_rl
+                .iter()
+                .copied()
+                .filter(|v| v.is_finite())
+                .fold(f64::NEG_INFINITY, log_add_exp);
+            if evidence.is_finite() {
+                for v in new_rl.iter_mut() {
+                    *v -= evidence;
+                }
+            }
+            if self.log_mass_cutoff > f64::NEG_INFINITY {
+                for r in (1..=max_r).rev() {
+                    if new_rl[r] >= self.log_mass_cutoff {
+                        break;
+                    }
+                    new_rl[r] = f64::NEG_INFINITY;
+                }
+            }
+            cp_probs.push(if new_rl[0].is_finite() {
+                new_rl[0].exp()
+            } else {
+                0.0
+            });
+            let mut new_stats = vec![self.prior.clone(); max_r + 1];
+            for r in 0..=active.min(max_r.saturating_sub(1)) {
+                if r < max_r && new_rl[r + 1] > f64::NEG_INFINITY {
+                    new_stats[r + 1] = stats[r].update(x);
+                }
+            }
+            rl_log = new_rl;
+            stats = new_stats;
+        }
+        (cps, cp_probs, original_indices)
+    }
+
+    /// Run BOCPD with a Viterbi-style backward decode for change-point
+    /// extraction.
+    ///
+    ///
+    /// Equivalent in semantics to `changepoint::utils::map_changepoints`.
+    /// `confidence` is `exp(V[t][0] - V_total)`, the marginalised
+    /// per-step CP posterior; `shift_sigma` matches `detect()`. Memory
+    /// O(n + max_rl).
+    pub fn detect_viterbi(&self, data: &[f64]) -> Vec<ChangePoint> {
+        let mut original_indices: Vec<usize> = Vec::new();
+        let data: Vec<f64> = data
+            .iter()
+            .enumerate()
+            .filter_map(|(i, &v)| {
+                if v.is_finite() {
+                    original_indices.push(i);
+                    Some(v)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let n = data.len();
+        if n < 20 {
+            return vec![];
+        }
+
+        let mean = data.iter().sum::<f64>() / n as f64;
+        let std = (data.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / n as f64).sqrt();
+        let std = if std < 1e-10 { 1.0 } else { std };
+        let norm: Vec<f64> = data.iter().map(|x| (x - mean) / std).collect();
+
+        let max_r = self.max_rl.min(n);
+        let beta = self.beta;
+        let prior_pred_at = |x: f64| self.prior.log_predictive_robust(x, beta);
+
+        // V[r] = max log P(r_t = r, x_{1:t}, best path to here). Stored
+        // un-normalised (max-plus, no log_sum_exp normalisation step --
+        // monotonic shifts cancel in the argmax). At each step we also
+        // record `prev_r_for_cp[t]`, the predecessor r' that maximised
+        // the CP transition into r_t = 0.
+        let mut v_log = vec![f64::NEG_INFINITY; max_r + 1];
+        v_log[0] = 0.0;
+        let mut new_v = vec![f64::NEG_INFINITY; max_r + 1];
+        let mut stats = vec![self.prior.clone(); max_r + 1];
+        let mut new_stats = vec![self.prior.clone(); max_r + 1];
+
+        let mut prev_r_for_cp: Vec<usize> = vec![0; n];
+        // Per-step posterior probability of CP, used as `confidence` on
+        // the emitted CPs. Computed from a renormalised-snapshot of V at
+        // that step (Viterbi's V is unnormalised, so we renormalise just
+        // for the confidence reading).
+        let mut cp_probs: Vec<f64> = vec![0.0; n];
+
+        for (t, &x) in norm.iter().enumerate() {
+            let active = (t + 1).min(max_r);
+            for v in new_v.iter_mut() {
+                *v = f64::NEG_INFINITY;
+            }
+            for s in new_stats.iter_mut() {
+                *s = self.prior.clone();
+            }
+
+            // CP transition: r_{t-1} = r' → r_t = 0. argmax over r'.
+            let mut best_pred = f64::NEG_INFINITY;
+            let mut best_pred_r = 0usize;
+            for (r, &v) in v_log.iter().enumerate().take(active.min(max_r) + 1) {
+                if !v.is_finite() {
+                    continue;
+                }
+                let candidate = v + self.hazard_log;
+                if candidate > best_pred {
+                    best_pred = candidate;
+                    best_pred_r = r;
+                }
+            }
+            let prior_pred = prior_pred_at(x);
+            new_v[0] = if best_pred.is_finite() && prior_pred.is_finite() {
+                best_pred + prior_pred
+            } else {
+                f64::NEG_INFINITY
+            };
+            prev_r_for_cp[t] = best_pred_r;
+
+            // Continuation: r_{t-1} = r → r_t = r + 1.
+            for r in 0..=active.min(max_r.saturating_sub(1)) {
+                if !v_log[r].is_finite() {
+                    continue;
+                }
+                let pred = stats[r].log_predictive_robust(x, beta);
+                if !pred.is_finite() {
+                    continue;
+                }
+                if r < max_r {
+                    let candidate = v_log[r] + pred + self.growth_log;
+                    if candidate > new_v[r + 1] {
+                        new_v[r + 1] = candidate;
+                    }
+                    new_stats[r + 1] = stats[r].update(x);
+                }
+            }
+
+            // Snapshot CP probability under a marginal renormalisation
+            // (purely for the emitted `confidence`; not used in the path).
+            let evidence = new_v
+                .iter()
+                .copied()
+                .filter(|v| v.is_finite())
+                .fold(f64::NEG_INFINITY, log_add_exp);
+            cp_probs[t] = if evidence.is_finite() && new_v[0].is_finite() {
+                (new_v[0] - evidence).exp()
+            } else {
+                0.0
+            };
+
+            std::mem::swap(&mut v_log, &mut new_v);
+            std::mem::swap(&mut stats, &mut new_stats);
+        }
+
+        // Backtrace from argmax_r V[n-1][r].
+        let r_n = v_log
+            .iter()
+            .enumerate()
+            .filter(|(_, v)| v.is_finite())
+            .max_by(|a, b| a.1.total_cmp(b.1))
+            .map(|(r, _)| r)
+            .unwrap_or(0);
+
+        let mut r_path = vec![0usize; n];
+        r_path[n - 1] = r_n;
+        for t in (1..n).rev() {
+            r_path[t - 1] = if r_path[t] == 0 {
+                prev_r_for_cp[t]
+            } else {
+                r_path[t] - 1
+            };
+        }
+
+        // CPs are steps where r_path[t] == 0 and t > 0 (t = 0 is the
+        // sequence start, not a CP). Drop t = 0; map back to original
+        // indices through the NaN-filter projection.
+        let mut result = Vec::new();
+        let w = 20;
+        for t in 1..n {
+            if r_path[t] != 0 {
+                continue;
+            }
+            let before = &norm[t.saturating_sub(w)..t];
+            let after = &norm[t..(t + w).min(n)];
+            let mean_b = if before.is_empty() {
+                0.0
+            } else {
+                before.iter().sum::<f64>() / before.len() as f64
+            };
+            let mean_a = if after.is_empty() {
+                0.0
+            } else {
+                after.iter().sum::<f64>() / after.len() as f64
+            };
+            let shift_sigma = (mean_a - mean_b).abs();
+            if shift_sigma < 1e-9 {
+                continue;
+            }
+            result.push(ChangePoint {
+                index: original_indices[t],
+                confidence: cp_probs[t].clamp(0.0, 1.0),
+                shift_sigma,
+            });
+        }
+        result
+    }
+
     /// Run multivariate BOCPD on d-dimensional data.
     ///
     /// `data` is a slice of d-dimensional observations (each `Vec<f64>` has length d).
