@@ -105,9 +105,18 @@ pub struct HcAggregator<S: ScoreStream> {
     /// rank windows have enough samples for stable empirical CDF.
     /// Default 100.
     warmup: usize,
+    persistence: usize,
     armed: bool,
     last_emit: Option<usize>,
     step_count: usize,
+    /// Consecutive steps where HC has been > threshold (for the
+    /// persistence filter). Reset to 0 on any step where HC ≤ τ.
+    consecutive_above: usize,
+    /// Streams that were in the contributing set on the most recent
+    /// step where HC > τ. Captured at trigger time so persistence-
+    /// confirmed fires can attribute to the original signal even if
+    /// later above-τ steps shifted the contributing set slightly.
+    pending_contributors: Vec<usize>,
     /// Per-stream rank-transform windows. Calibrate scores → p-values
     /// empirically so HC's threshold is meaningful regardless of the
     /// stream's score distribution under H_0.
@@ -125,11 +134,21 @@ pub struct HcAggregatorState {
     pub cooldown: usize,
     #[serde(default = "default_hc_warmup")]
     pub warmup: usize,
+    #[serde(default = "default_hc_persistence")]
+    pub persistence: usize,
     pub armed: bool,
     pub last_emit: Option<usize>,
     pub step_count: usize,
     #[serde(default)]
+    pub consecutive_above: usize,
+    #[serde(default)]
+    pub pending_contributors: Vec<usize>,
+    #[serde(default)]
     pub(crate) rank_windows: Vec<RankWindow>,
+}
+
+fn default_hc_persistence() -> usize {
+    1
 }
 
 fn default_hc_warmup() -> usize {
@@ -175,9 +194,12 @@ impl<S: ScoreStream> HcAggregator<S> {
             // warmup = rank window capacity so the empirical CDF is
             // populated from a full window before HC fires.
             warmup: 100,
+            persistence: 1,
             armed: false,
             last_emit: None,
             step_count: 0,
+            consecutive_above: 0,
+            pending_contributors: Vec::new(),
             rank_windows: (0..d).map(|_| RankWindow::new(100)).collect(),
         }
     }
@@ -206,6 +228,22 @@ impl<S: ScoreStream> HcAggregator<S> {
         assert!(capacity > 0, "rank window capacity must be > 0");
         let d = self.streams.len();
         self.rank_windows = (0..d).map(|_| RankWindow::new(capacity)).collect();
+        self
+    }
+
+    /// Persistence filter: require HC > threshold for `n` consecutive
+    /// steps before firing. Default 1 (no filter; backwards-compat
+    /// with the single-step baseline).
+    ///
+    ///
+    ///
+    ///
+    ///
+    /// # Panics
+    /// Panics if `n == 0`.
+    pub fn with_persistence(mut self, n: usize) -> Self {
+        assert!(n > 0, "persistence must be ≥ 1, got {n}");
+        self.persistence = n;
         self
     }
 
@@ -265,18 +303,33 @@ impl<S: ScoreStream> HcAggregator<S> {
                 if hc_stat < 1.0 {
                     self.armed = true;
                 }
+                self.consecutive_above = 0;
+                self.pending_contributors.clear();
                 continue;
             }
 
             if hc_stat > self.threshold {
-                let confidence = (hc_stat / self.threshold / 2.0).clamp(0.0, 1.0);
-                out.push(MultiStreamChangePoint {
-                    index: i,
-                    confidence,
-                    streams: contributing,
-                });
-                self.last_emit = Some(i);
-                self.armed = false;
+                if self.consecutive_above == 0 {
+                    // First step of a potential persistent excursion --
+                    // capture the contributing set at the leading edge.
+                    self.pending_contributors = contributing;
+                }
+                self.consecutive_above += 1;
+                if self.consecutive_above >= self.persistence {
+                    let confidence = (hc_stat / self.threshold / 2.0).clamp(0.0, 1.0);
+                    out.push(MultiStreamChangePoint {
+                        index: i,
+                        confidence,
+                        streams: std::mem::take(&mut self.pending_contributors),
+                    });
+                    self.last_emit = Some(i);
+                    self.armed = false;
+                    self.consecutive_above = 0;
+                }
+            } else {
+                // HC dipped below τ -- reset the persistence counter.
+                self.consecutive_above = 0;
+                self.pending_contributors.clear();
             }
         }
         out
@@ -288,9 +341,12 @@ impl<S: ScoreStream> HcAggregator<S> {
             threshold: self.threshold,
             cooldown: self.cooldown,
             warmup: self.warmup,
+            persistence: self.persistence,
             armed: self.armed,
             last_emit: self.last_emit,
             step_count: self.step_count,
+            consecutive_above: self.consecutive_above,
+            pending_contributors: self.pending_contributors.clone(),
             rank_windows: self.rank_windows.clone(),
         }
     }
@@ -336,9 +392,12 @@ impl<S: ScoreStream> HcAggregator<S> {
             threshold: state.threshold,
             cooldown: state.cooldown,
             warmup: state.warmup,
+            persistence: state.persistence.max(1),
             armed: state.armed,
             last_emit: state.last_emit,
             step_count: state.step_count,
+            consecutive_above: state.consecutive_above,
+            pending_contributors: state.pending_contributors,
             rank_windows,
         })
     }
@@ -561,5 +620,152 @@ mod tests {
         let (hc, contrib) = hc_statistic(&p);
         assert!(hc > 1.0, "extreme minimum should drive HC > 1, got {hc}");
         assert_eq!(contrib, vec![0]);
+    }
+
+    #[test]
+    fn persistence_blocks_transient_single_step_spike() {
+        // Stream 0 has a SINGLE-step spike at step 50; sub-neutral
+        // before and after. With persistence=3, HC sees one above-τ
+        // step then drops back -- the persistence counter resets,
+        // never fires.
+        let mk = |spike_step: Option<usize>, spike: f64| {
+            let mut v = vec![1.0; 100];
+            if let Some(idx) = spike_step {
+                v[idx] = spike;
+            }
+            ScriptedStream::new(v, ScoreKind::BayesFactor)
+        };
+        let s0 = mk(Some(50), 50.0); // huge isolated spike
+        let s1 = mk(None, 0.0);
+        let s2 = mk(None, 0.0);
+        let s3 = mk(None, 0.0);
+        let mut agg = HcAggregator::new(vec![s0, s1, s2, s3])
+            .with_threshold(1.5)
+            .with_rank_window(30)
+            .with_warmup(30)
+            .with_persistence(3);
+        let dummy: Vec<Vec<f64>> = (0..100).map(|_| vec![0.0; 4]).collect();
+        let cps = agg.step(&dummy);
+        assert!(
+            cps.is_empty(),
+            "persistence=3 should block a 1-step transient spike, got {:?}",
+            cps.iter().map(|c| c.index).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn persistence_allows_sustained_excursion() {
+        // Stream 0 has a SUSTAINED elevated score from step 50 onward
+        // (10 consecutive steps of 50.0). With persistence=2 HC fires
+        // after the second consecutive above-τ step.
+        //
+        // Note: rank-transform adapts -- as the sustained value enters
+        // the window, its rank rises (less "extreme") and HC drops.
+        // For windows of capacity 30, sustained values stay rank-
+        // extreme for ~2-3 steps before the window saturates with the
+        // shifted value. persistence=2 fits within that budget;
+        // persistence=3 wouldn't on this fixture. Real-world detectors
+        // pair persistence with a larger window OR sliding-baseline
+        // window that excludes recent samples.
+        let mk = |sustain_from: Option<usize>, value: f64| {
+            let mut v = vec![1.0; 100];
+            if let Some(start) = sustain_from {
+                for s in &mut v[start..(start + 10).min(100)] {
+                    *s = value;
+                }
+            }
+            ScriptedStream::new(v, ScoreKind::BayesFactor)
+        };
+        let s0 = mk(Some(50), 50.0);
+        let s1 = mk(None, 0.0);
+        let s2 = mk(None, 0.0);
+        let s3 = mk(None, 0.0);
+        let mut agg = HcAggregator::new(vec![s0, s1, s2, s3])
+            .with_threshold(1.5)
+            .with_rank_window(30)
+            .with_warmup(30)
+            .with_persistence(2);
+        let dummy: Vec<Vec<f64>> = (0..100).map(|_| vec![0.0; 4]).collect();
+        let cps = agg.step(&dummy);
+        assert!(!cps.is_empty(), "persistence=2 should fire on sustained excursion");
+        assert_eq!(
+            cps[0].streams,
+            vec![0],
+            "attribution captured at leading edge, got {:?}",
+            cps[0].streams
+        );
+        assert!(
+            cps[0].index >= 50 && cps[0].index <= 60,
+            "fires within sustained window, got {}",
+            cps[0].index
+        );
+    }
+
+    #[test]
+    fn persistence_default_is_one_no_filter() {
+        // Default persistence=1 permits a fire on any
+        // single-step above-τ fires immediately.
+        let mk = |spike_step: Option<usize>, spike: f64| {
+            let mut v = vec![1.0; 100];
+            if let Some(idx) = spike_step {
+                v[idx] = spike;
+            }
+            ScriptedStream::new(v, ScoreKind::BayesFactor)
+        };
+        let s0 = mk(Some(50), 50.0);
+        let s1 = mk(None, 0.0);
+        let s2 = mk(None, 0.0);
+        let s3 = mk(None, 0.0);
+        let mut agg = HcAggregator::new(vec![s0, s1, s2, s3])
+            .with_threshold(1.5)
+            .with_rank_window(30)
+            .with_warmup(30);
+        // No with_persistence call → uses default 1.
+        let dummy: Vec<Vec<f64>> = (0..100).map(|_| vec![0.0; 4]).collect();
+        let cps = agg.step(&dummy);
+        assert!(
+            !cps.is_empty(),
+            "persistence=1 (default) should fire on single-step spike"
+        );
+    }
+
+    #[test]
+    fn persistence_state_round_trips() {
+        let mk = || ScriptedStream::new(vec![0.7; 60], ScoreKind::BayesFactor);
+        let mut agg = HcAggregator::new(vec![mk(), mk(), mk()])
+            .with_rank_window(20)
+            .with_warmup(20)
+            .with_persistence(3);
+        let dummy: Vec<Vec<f64>> = (0..40).map(|_| vec![0.0; 3]).collect();
+        agg.step(&dummy);
+
+        let json = serde_json::to_string(&agg.save_state()).unwrap();
+        let restored: HcAggregatorState = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.persistence, 3, "persistence must survive serde");
+        let _ = HcAggregator::restore(restored, vec![mk(), mk(), mk()]).unwrap();
+    }
+
+    #[test]
+    fn persistence_forward_compat_zero_clamped_to_one() {
+        // Snapshots without `persistence` use the default of 1. But
+        // a hand-crafted snapshot with 0 should clamp to 1 on restore
+        // (avoid the divide-by-zero / fire-immediately edge case).
+        let mk = || ScriptedStream::new(vec![0.7; 60], ScoreKind::BayesFactor);
+        let mut agg = HcAggregator::new(vec![mk(), mk(), mk()]);
+        let _ = agg.step(&(0..30).map(|_| vec![0.0; 3]).collect::<Vec<_>>());
+        let mut state = agg.save_state();
+        state.persistence = 0;
+        let restored = HcAggregator::restore(state, vec![mk(), mk(), mk()]).unwrap();
+        assert!(
+            restored.persistence >= 1,
+            "persistence must be clamped to ≥ 1"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "persistence must be ≥ 1")]
+    fn with_persistence_zero_panics() {
+        let mk = || ScriptedStream::new(vec![0.7; 10], ScoreKind::BayesFactor);
+        let _ = HcAggregator::new(vec![mk(), mk()]).with_persistence(0);
     }
 }

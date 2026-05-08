@@ -125,6 +125,65 @@ fn sum_cusum_save_restore_round_trips_with_real_streams() {
 }
 
 #[test]
+#[ignore]
+fn detection_delta_persistence_levels() {
+    let seeds: [u64; 5] = [7, 11, 17, 23, 31];
+    let thresholds = [2.0, 3.0, 5.0];
+    let persistences = [1usize, 2, 3];
+    eprintln!("DEBUG detection_delta sparse 5σ 1-of-4:");
+    eprintln!("  τ \\ persistence  1   2   3");
+    for &tau in &thresholds {
+        let mut row = format!("  τ={tau:.1}  ");
+        for &pers in &persistences {
+            let mut hits = 0usize;
+            for &seed in &seeds {
+                let streams = make_bf_streams(4);
+                let mut hc = HcAggregator::new(streams)
+                    .with_threshold(tau)
+                    .with_persistence(pers);
+                let tape = make_tape(300, 150, 4, &[0], 5.0, seed);
+                let cps = hc.step(&tape);
+                if cps
+                    .iter()
+                    .any(|c| (150..=230).contains(&c.index) && c.streams.contains(&0))
+                {
+                    hits += 1;
+                }
+            }
+            row.push_str(&format!("  {hits}/5"));
+        }
+        eprintln!("{row}");
+    }
+}
+
+#[test]
+#[ignore]
+fn far_delta_persistence_levels() {
+    let seeds: [u64; 5] = [7, 11, 17, 23, 31];
+    let thresholds = [2.0, 3.0, 5.0];
+    let persistences = [1usize, 2, 3];
+    eprintln!("DEBUG far_delta_persistence_levels:");
+    eprintln!("  τ \\ persistence    1     2     3");
+    for &tau in &thresholds {
+        let mut row = format!("  τ={tau:.1}  ");
+        for &pers in &persistences {
+            let mut total_fires = 0usize;
+            for &seed in &seeds {
+                let streams = make_bf_streams(4);
+                let mut hc = HcAggregator::new(streams)
+                    .with_threshold(tau)
+                    .with_persistence(pers);
+                let tape = make_tape(300, 10_000, 4, &[], 0.0, seed);
+                let cps = hc.step(&tape);
+                total_fires += cps.len();
+            }
+            row.push_str(&format!("  {total_fires:3}  "));
+        }
+        eprintln!("{row}");
+    }
+}
+
+#[test]
 #[should_panic(expected = "score_kind")]
 fn hc_aggregator_refuses_mixed_score_kind_streams() {
     // Mixing BF and MAP-drop streams is rejected at construction --
