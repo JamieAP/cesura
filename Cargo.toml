@@ -70,3 +70,9 @@ required-features = ["test-utils"]
 name = "conformal_overhead"
 harness = false
 required-features = ["test-utils"]
+
+[[bench]]
+name = "detectors_throughput"
+harness = false
+required-features = ["test-utils"]
+
