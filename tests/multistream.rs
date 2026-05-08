@@ -1,0 +1,137 @@
+//! Integration tests for the multistream aggregators against real
+//! `StreamingDetector` instances.
+//!
+//! Scope: WIRING. Confirms the trait surface composes correctly --
+//! `StreamingDetector` implements `ScoreStream`, aggregators consume
+//! it, step()/save_state()/restore() round-trip. Per-aggregator
+//! statistical behavior is tested against scripted streams in the
+//! unit suites (`src/multistream/{hc,sum_cusum}.rs`).
+//!
+
+#![cfg(feature = "test-utils")]
+
+use cesura::eval::Rng;
+use cesura::multistream::{
+    HcAggregator, HcAggregatorState, ScoreKind, ScoreStream, SumCusumAggregator,
+    SumCusumAggregatorState,
+};
+use cesura::streaming::StreamingDetector;
+
+fn make_bf_streams(d: usize) -> Vec<StreamingDetector> {
+    (0..d)
+        .map(|_| StreamingDetector::new(200.0, 250).with_bayes_factor_rule(2.0, 3, 15))
+        .collect()
+}
+
+fn make_map_streams(d: usize) -> Vec<StreamingDetector> {
+    (0..d).map(|_| StreamingDetector::new(200.0, 250)).collect()
+}
+
+fn make_tape(n: usize, cp_step: usize, d: usize, affected: &[usize], shift_sigma: f64, seed: u64) -> Vec<Vec<f64>> {
+    let mut rng = Rng::new(seed);
+    let mut tape = Vec::with_capacity(n);
+    for t in 0..n {
+        let mut row = Vec::with_capacity(d);
+        for d_i in 0..d {
+            let mu = if t >= cp_step && affected.contains(&d_i) {
+                shift_sigma
+            } else {
+                0.0
+            };
+            row.push(mu + rng.normal(0.0, 1.0));
+        }
+        tape.push(row);
+    }
+    tape
+}
+
+#[test]
+fn streaming_detector_implements_scorestream_bf() {
+    let mut det = StreamingDetector::new(200.0, 250).with_bayes_factor_rule(2.0, 3, 15);
+    assert_eq!(det.score_kind(), ScoreKind::BayesFactor);
+    let s = det.step_score(0.0);
+    assert!(s.is_finite(), "BF score after one step must be finite, got {s}");
+    assert_eq!(det.step_count(), 1);
+}
+
+#[test]
+fn streaming_detector_implements_scorestream_map_drop() {
+    let mut det = StreamingDetector::new(200.0, 250);
+    assert_eq!(det.score_kind(), ScoreKind::CpProbability);
+    let s = det.step_score(0.0);
+    assert!((0.0..=1.0).contains(&s), "cp_prob ∈ [0,1], got {s}");
+}
+
+#[test]
+fn hc_aggregator_consumes_streamingdetector_bf_streams_without_panic() {
+    let mut hc = HcAggregator::new(make_bf_streams(3));
+    let tape = make_tape(150, 10_000, 3, &[], 0.0, 7);
+    let _ = hc.step(&tape);
+    assert_eq!(hc.step_count(), 150);
+}
+
+#[test]
+fn hc_aggregator_consumes_streamingdetector_cpprob_streams_without_panic() {
+    // After rank-transform calibration shipped, HC accepts both
+    // ScoreKind::BayesFactor and ScoreKind::CpProbability. Wiring
+    // verification only -- behavioral calibration deferred.
+    let mut hc = HcAggregator::new(make_map_streams(3));
+    let tape = make_tape(150, 10_000, 3, &[], 0.0, 11);
+    let _ = hc.step(&tape);
+    assert_eq!(hc.step_count(), 150);
+}
+
+#[test]
+fn sum_cusum_aggregator_consumes_streamingdetector_streams_without_panic() {
+    let mut bf_agg = SumCusumAggregator::new(make_bf_streams(3));
+    let cp_agg_streams = make_map_streams(3);
+    let mut cp_agg = SumCusumAggregator::new(cp_agg_streams);
+
+    let tape = make_tape(150, 10_000, 3, &[], 0.0, 13);
+    let _ = bf_agg.step(&tape);
+    let _ = cp_agg.step(&tape);
+    assert_eq!(bf_agg.step_count(), 150);
+    assert_eq!(cp_agg.step_count(), 150);
+}
+
+#[test]
+fn hc_save_restore_round_trips_with_real_streams() {
+    let mut hc = HcAggregator::new(make_bf_streams(3));
+    let tape = make_tape(120, 10_000, 3, &[], 0.0, 17);
+    let _ = hc.step(&tape);
+
+    let json = serde_json::to_string(&hc.save_state()).unwrap();
+    let restored: HcAggregatorState = serde_json::from_str(&json).unwrap();
+    assert_eq!(restored.step_count, 120);
+    assert_eq!(restored.score_kind, ScoreKind::BayesFactor);
+    let _ = HcAggregator::restore(restored, make_bf_streams(3))
+        .expect("restore must succeed with matching stream count");
+}
+
+#[test]
+fn sum_cusum_save_restore_round_trips_with_real_streams() {
+    let mut agg = SumCusumAggregator::new(make_bf_streams(3));
+    let tape = make_tape(120, 10_000, 3, &[], 0.0, 19);
+    let _ = agg.step(&tape);
+
+    let json = serde_json::to_string(&agg.save_state()).unwrap();
+    let restored: SumCusumAggregatorState = serde_json::from_str(&json).unwrap();
+    assert_eq!(restored.step_count, 120);
+    assert_eq!(restored.score_kind, ScoreKind::BayesFactor);
+    assert_eq!(restored.per_stream_w.len(), 3);
+
+    let _ = SumCusumAggregator::restore(restored, make_bf_streams(3))
+        .expect("restore must succeed with matching stream count");
+}
+
+#[test]
+#[should_panic(expected = "score_kind")]
+fn hc_aggregator_refuses_mixed_score_kind_streams() {
+    // Mixing BF and MAP-drop streams is rejected at construction --
+    // even though rank-transform makes both p-value calibrations work
+    // in isolation, mixing them in one aggregator confuses HC's
+    // threshold.
+    let mut streams = make_bf_streams(2);
+    streams.push(StreamingDetector::new(200.0, 250)); // CpProbability
+    let _ = HcAggregator::new(streams);
+}

@@ -61,6 +61,10 @@ required-features = ["test-utils", "joint-detection"]
 name = "streaming_chen_wu"
 required-features = ["test-utils", "joint-detection"]
 
+[[test]]
+name = "multistream"
+required-features = ["test-utils"]
+
 [[bench]]
 name = "focus_pruning"
 harness = false

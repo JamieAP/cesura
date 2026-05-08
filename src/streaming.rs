@@ -636,6 +636,58 @@ impl StreamingDetector {
     pub fn current_map_rl(&self) -> usize {
         self.map_rls.last().copied().unwrap_or(0)
     }
+
+    /// Per-step change-evidence score, derived from current state.
+    /// In BF mode: `bf_val = short_mass / (1 - short_mass)`.
+    /// In MAP-drop mode: `cp_probs[total_steps - 1]` -- the BOCPD
+    /// posterior P(r=0).
+    /// Returns 0 before any observations have been processed.
+    /// **Convention: higher = more change-evidence.** Used by
+    /// `multistream::ScoreStream`.
+    pub fn last_score(&self) -> f64 {
+        if self.total_steps == 0 {
+            return 0.0;
+        }
+        let i = self.total_steps - 1;
+        match self.bf_rule.as_ref() {
+            Some(bf) => {
+                let cap = bf.short_horizon.min(self.max_rl);
+                let mut sm_log = f64::NEG_INFINITY;
+                for r in 0..=cap {
+                    let v = self.rl_log[r];
+                    if v.is_finite() {
+                        sm_log = log_add_exp(sm_log, v);
+                    }
+                }
+                let sm = if sm_log.is_finite() { sm_log.exp() } else { 0.0 };
+                let long = (1.0 - sm).max(1e-12);
+                sm / long
+            }
+            None => self.cp_probs[i],
+        }
+    }
+}
+
+impl crate::multistream::ScoreStream for StreamingDetector {
+    fn step_score(&mut self, x: f64) -> f64 {
+        // Run the recursion on this single observation; ignore any
+        // CPs the detector itself emits (the aggregator owns the
+        // multi-stream trigger). Then read the per-step score.
+        let _ = self.step(&[x]);
+        self.last_score()
+    }
+
+    fn score_kind(&self) -> crate::multistream::ScoreKind {
+        if self.bf_rule.is_some() {
+            crate::multistream::ScoreKind::BayesFactor
+        } else {
+            crate::multistream::ScoreKind::CpProbability
+        }
+    }
+
+    fn step_count(&self) -> usize {
+        self.total_steps
+    }
 }
 
 #[cfg(test)]

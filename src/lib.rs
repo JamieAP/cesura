@@ -39,6 +39,7 @@ pub mod predictive;
 pub mod streaming;
 #[cfg(feature = "joint-detection")]
 pub mod streaming_chen_wu;
+pub mod multistream;
 
 mod bocpd;
 mod math;
@@ -47,6 +48,10 @@ mod nig;
 pub use bocpd::BocpdDetector;
 pub use conformal::{ConformalCp, ConformalCpWrapper, MvScoredDetect, ScoredDetect};
 pub use ensemble::EnsembleDetector;
+pub use multistream::{
+    HcAggregator, HcAggregatorState, MultiStreamChangePoint, ScoreKind, ScoreStream,
+    SumCusumAggregator, SumCusumAggregatorState,
+};
 pub use nig::Nig;
 pub use nig_ar1::NigAr1;
 pub use predictive::Predictive;
