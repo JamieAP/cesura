@@ -79,7 +79,10 @@ struct Piece {
 /// deque; pieces in `ql` (left deque) have strictly decreasing argmax.
 /// The τ=0 piece (`s_tau = 0`) is the implicit pre-change baseline and
 /// always sits at the front of both deques.
-#[derive(Clone, Default)]
+///
+/// Construct only via [`PruningState::new`]; an empty deque has no
+/// baseline and would mis-compute the first step's stat.
+#[derive(Clone)]
 struct PruningState {
     qr: VecDeque<Piece>,
     ql: VecDeque<Piece>,
@@ -244,17 +247,16 @@ fn naive_inner_loop(seg_sums: &[f64], total: f64, m: usize) -> (f64, usize) {
 
 impl PruningState {
     fn new() -> Self {
-        let mut s = Self::default();
-        s.reseed_baseline();
-        s
+        let baseline = Piece { tau: 0, s_tau: 0.0 };
+        let mut qr = VecDeque::new();
+        let mut ql = VecDeque::new();
+        qr.push_back(baseline);
+        ql.push_back(baseline);
+        Self { qr, ql }
     }
 
     fn reseed_baseline(&mut self) {
-        self.qr.clear();
-        self.ql.clear();
-        let baseline = Piece { tau: 0, s_tau: 0.0 };
-        self.qr.push_back(baseline);
-        self.ql.push_back(baseline);
+        *self = Self::new();
     }
 
     /// Replay the prune+append cycle over `seg_sums` so the deque
