@@ -1,6 +1,11 @@
 //! Bayesian Online Change Point detector (univariate + multivariate).
 
 use crate::conformal::{MvScoredDetect, ScoredDetect};
+
+/// Tuple returned by [`BocpdDetector::run_recursion`]:
+/// `(norm, map_rls, cp_probs, original_indices)`. See the method
+/// docstring for the meaning of each field.
+type RecursionOutputs = (Vec<f64>, Vec<usize>, Vec<f64>, Vec<usize>);
 use crate::math::log_add_exp;
 use crate::niw;
 use crate::nig::Nig;
@@ -612,6 +617,239 @@ impl<P: Predictive> BocpdDetector<P> {
     ///
     /// Consumed by [`crate::ConformalCpWrapper`] via the
     /// [`crate::ScoredDetect`] trait.
+    /// Run the BOCPD recursion to completion and return `(norm,
+    /// map_rls, cp_probs, original_indices)` -- the four shared
+    /// outputs that `detect`, `detect_with_score`, and `detect_cusum`
+    /// each post-process with a different decision rule.
+    ///
+    /// `norm` is normalized using the full finite input series;
+    /// `original_indices` maps normalized positions back to the
+    /// caller's input space. These batch diagnostics are retrospective.
+    /// `map_rls[t]` is `argmax_r p(r_t = r | y_{1:t})` -- the standard
+    /// MAP run length used by the MAP-drop heuristic.
+    /// `cp_probs[t]` is `p(r_t = 0 | y_{1:t})` -- the per-step posterior
+    /// of being at the first step of a new regime, consumed by the
+    /// CUSUM and conformal score paths.
+    ///
+    /// Returns `None` when the input has fewer than 20 finite samples
+    /// (early-return parity with the public detection methods).
+    pub(crate) fn run_recursion(&self, data: &[f64]) -> Option<RecursionOutputs> {
+        let mut original_indices: Vec<usize> = Vec::new();
+        let data: Vec<f64> = data
+            .iter()
+            .enumerate()
+            .filter_map(|(i, &v)| {
+                if v.is_finite() {
+                    original_indices.push(i);
+                    Some(v)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let n = data.len();
+        if n < 20 {
+            return None;
+        }
+        let mean = data.iter().sum::<f64>() / n as f64;
+        let std = (data.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / n as f64).sqrt();
+        let std = if std < 1e-10 { 1.0 } else { std };
+        let norm: Vec<f64> = data.iter().map(|x| (x - mean) / std).collect();
+
+        let max_r = self.max_rl.min(n);
+        let mut rl_log = vec![f64::NEG_INFINITY; max_r + 1];
+        rl_log[0] = 0.0;
+        let mut stats = vec![self.prior.clone(); max_r + 1];
+        let mut map_rls = Vec::with_capacity(n);
+        let mut cp_probs = Vec::with_capacity(n);
+
+        let beta = self.beta;
+        let prior_pred_at = |x: f64| self.prior.log_predictive_robust(x, beta);
+        let hazard_log = self.hazard_log();
+        let growth_log = self.growth_log();
+
+        for (t, &x) in norm.iter().enumerate() {
+            let active = (t + 1).min(max_r);
+            let mut new_rl = vec![f64::NEG_INFINITY; max_r + 1];
+            let mut prev_mass = f64::NEG_INFINITY;
+            for r in 0..=active.min(max_r.saturating_sub(1)) {
+                if rl_log[r] == f64::NEG_INFINITY {
+                    continue;
+                }
+                let pred = stats[r].log_predictive_robust(x, beta);
+                if !pred.is_finite() {
+                    continue;
+                }
+                if r < max_r {
+                    new_rl[r + 1] = log_add_exp(new_rl[r + 1], rl_log[r] + pred + growth_log);
+                }
+                prev_mass = log_add_exp(prev_mass, rl_log[r]);
+            }
+            let prior_pred = prior_pred_at(x);
+            new_rl[0] = if prior_pred.is_finite() && prev_mass.is_finite() {
+                prev_mass + hazard_log + prior_pred
+            } else {
+                f64::NEG_INFINITY
+            };
+            let evidence = new_rl
+                .iter()
+                .copied()
+                .filter(|v| v.is_finite())
+                .fold(f64::NEG_INFINITY, log_add_exp);
+            if evidence.is_finite() {
+                for v in new_rl.iter_mut() {
+                    *v -= evidence;
+                }
+            }
+            if self.log_mass_cutoff > f64::NEG_INFINITY {
+                for r in (1..=max_r).rev() {
+                    if new_rl[r] >= self.log_mass_cutoff {
+                        break;
+                    }
+                    new_rl[r] = f64::NEG_INFINITY;
+                }
+            }
+            let map_r = new_rl
+                .iter()
+                .enumerate()
+                .filter(|(_, v)| v.is_finite())
+                .max_by(|a, b| a.1.total_cmp(b.1))
+                .map(|(r, _)| r)
+                .unwrap_or(0);
+            map_rls.push(map_r);
+            cp_probs.push(if new_rl[0].is_finite() {
+                new_rl[0].exp()
+            } else {
+                0.0
+            });
+            let mut new_stats = vec![self.prior.clone(); max_r + 1];
+            for r in 0..=active.min(max_r.saturating_sub(1)) {
+                if r < max_r && new_rl[r + 1] > f64::NEG_INFINITY {
+                    new_stats[r + 1] = stats[r].update(x);
+                }
+            }
+            rl_log = new_rl;
+            stats = new_stats;
+        }
+        Some((norm, map_rls, cp_probs, original_indices))
+    }
+
+    /// CUSUM-on-cp_probs[] decision rule. Replaces the MAP-drop
+    /// heuristic with a calibrated cumulative-sum statistic on
+    /// `cp_probs[t] = p(r_t = 0 | y_{1:t})`.
+    ///
+    /// At each step:
+    ///
+    /// ```text
+    ///     S_t = max(0, S_{t-1} + cp_probs[t] − reference)
+    /// ```
+    ///
+    /// Emit a CP when `S_t > threshold`, then reset `S_t = 0` and
+    /// enter a `cooldown`-step lockout.
+    ///
+    ///
+    /// A non-zero `reference` recovers the classical Page-CUSUM
+    /// drift-subtracted form. Be conservative: setting `reference`
+    /// near `1 / λ` can swallow the CP signal entirely, since
+    /// per-step `cp_prob` rarely exceeds the reference under
+    /// well-specified models.
+    ///
+    /// Why this is interesting vs MAP-drop:
+    ///
+    /// 1. Single tunable (`threshold`) with a clean ARL₀ calibration
+    ///    story instead of MAP-drop's three magic numbers
+    ///    (`drop_to`, `cooldown`, `min_prev_rl`).
+    /// 2. Catches gradual posterior drift that doesn't collapse the
+    ///    MAP run length sharply enough for MAP-drop to fire.
+    /// 3. The statistic accumulates posterior CP probability from
+    ///    the configured model; detection thresholds need calibration.
+    ///
+    /// `threshold = 1.0` is a reasonable starting point for
+    /// `λ ≈ 200` on near-Gaussian data; calibrate via simulation
+    /// for tighter ARL₀ control. `cooldown = 15` matches `detect()`'s
+    /// internal cooldown.
+    ///
+    /// Returns CP indices in the **caller's** input space (non-finite
+    /// samples are filtered before the recursion runs; the emitted
+    /// `index` is mapped back).
+    ///
+    pub fn detect_cusum(
+        &self,
+        data: &[f64],
+        threshold: f64,
+        reference: Option<f64>,
+        cooldown: usize,
+    ) -> Vec<ChangePoint> {
+        assert!(threshold > 0.0, "threshold must be > 0, got {threshold}");
+        let Some((norm, _map_rls, cp_probs, original_indices)) = self.run_recursion(data) else {
+            return Vec::new();
+        };
+        let n = norm.len();
+        // Default reference is a small slow-decay term: 1 / (10·λ).
+        // For λ=200 this is 5e-4 -- well below typical CP spikes
+        // (0.3-0.85 per the v0.3 CHANGELOG) but large enough that
+        // between-CP accumulation decays back to 0 over a few hundred
+        // stationary steps. Pure-CUSUM (reference=0) over-accumulates
+        // and emits at indices much later than the true CP because
+        // residual mass from one CP's spike never decays. Caller can
+        // override via `Some(0.0)` for pure-CUSUM semantics or
+        // `Some(0.9)` to deliberately suppress.
+        let reference = reference.unwrap_or_else(|| 1.0 / (10.0 * self.lambda));
+        assert!(
+            reference >= 0.0,
+            "reference must be ≥ 0, got {reference}"
+        );
+
+        let mut out = Vec::new();
+        let mut s = 0.0_f64;
+        let mut last_emit: Option<usize> = None;
+        for (t, &p) in cp_probs.iter().enumerate() {
+            // Honour cooldown: skip update + emission while inside the
+            // lockout window (cumsum is also reset at emission, so
+            // re-accumulation from zero is the natural recovery).
+            if let Some(last) = last_emit {
+                if t.saturating_sub(last) <= cooldown {
+                    continue;
+                }
+            }
+            s = (s + p - reference).max(0.0);
+            if s > threshold {
+                let look_back = cooldown.min(t);
+                let confidence = cp_probs[t.saturating_sub(look_back)..=t]
+                    .iter()
+                    .copied()
+                    .fold(0.0_f64, f64::max)
+                    .clamp(0.0, 1.0);
+                let w = 20;
+                let before = &norm[t.saturating_sub(w)..t];
+                let after = &norm[t..(t + w).min(n)];
+                let mean_b = if before.is_empty() {
+                    0.0
+                } else {
+                    before.iter().sum::<f64>() / before.len() as f64
+                };
+                let mean_a = if after.is_empty() {
+                    0.0
+                } else {
+                    after.iter().sum::<f64>() / after.len() as f64
+                };
+                let shift_sigma = (mean_a - mean_b).abs();
+                if shift_sigma < 1e-9 {
+                    s = 0.0;
+                    continue;
+                }
+                out.push(ChangePoint {
+                    index: original_indices[t],
+                    confidence,
+                    shift_sigma,
+                });
+                last_emit = Some(t);
+                s = 0.0;
+            }
+        }
+        out
+    }
+
     pub(crate) fn detect_with_score(&self, data: &[f64]) -> Vec<(ChangePoint, f64)> {
         let mut original_indices: Vec<usize> = Vec::new();
         let data: Vec<f64> = data
@@ -2101,6 +2339,166 @@ mod tests {
             cps[0].index >= 95,
             "index {} is too low -- NaN filtering shifted indices",
             cps[0].index
+        );
+    }
+
+    // ── CUSUM-on-cp_probs[] decision rule ────────────────────────────
+
+    #[test]
+    fn detect_cusum_clean_shift() {
+        // Sanity: clean 5σ shift fires within ±25 steps of truth.
+        let mut rng = Rng::new(0xCC51);
+        let mut data: Vec<f64> = (0..150).map(|_| rng.normal(0.0, 1.0)).collect();
+        data.extend((0..150).map(|_| rng.normal(5.0, 1.0)));
+        let det = BocpdDetector::new(200.0, 350);
+        let cps = det.detect_cusum(&data, 0.5, None, 15);
+        assert!(!cps.is_empty(), "must detect a clean 5σ shift");
+        assert!(
+            (cps[0].index as i64 - 150).abs() < 25,
+            "first CP at {} too far from truth 150",
+            cps[0].index
+        );
+    }
+
+    #[test]
+    fn detect_cusum_arl0_increases_with_threshold() {
+        // Light gate on ARL₀ behaviour. Reports first-fire indices on
+        // 5 × 1000 N(0,1) trials at thresholds {0.5, 1.0, 2.0}. Pins
+        // the qualitative ordering ARL₀(0.5) < ARL₀(1.0) < ARL₀(2.0)
+        // and a soft floor that ARL₀(2.0) ≥ 500 -- mirrors the
+        // calibration-grade gate from `focus_arl0_at_threshold_8_is_high`
+        // but at the CUSUM threshold scale.
+        //
+        let trials = 5;
+        let mut arl0s = Vec::new();
+        for &thresh in &[0.5_f64, 1.0, 2.0] {
+            let mut total = 0.0;
+            for t in 0..trials {
+                let mut rng = Rng::new(3000 + t);
+                let det = BocpdDetector::new(200.0, 350);
+                let data: Vec<f64> = (0..1000).map(|_| rng.normal(0.0, 1.0)).collect();
+                let cps = det.detect_cusum(&data, thresh, None, 15);
+                total += cps.first().map(|c| c.index as f64).unwrap_or(1000.0);
+            }
+            let arl0 = total / trials as f64;
+            eprintln!("CUSUM ARL₀ at threshold={thresh}: {arl0:.0}");
+            arl0s.push(arl0);
+        }
+        assert!(
+            arl0s[0] < arl0s[1] && arl0s[1] <= arl0s[2],
+            "ARL₀ should be monotone non-decreasing in threshold; got {arl0s:?}"
+        );
+        assert!(
+            arl0s[2] >= 500.0,
+            "ARL₀ at threshold=2.0 should be ≥ 500; got {}",
+            arl0s[2]
+        );
+    }
+
+    #[test]
+    fn detect_cusum_threshold_monotone_in_far() {
+        // Higher threshold ⇒ fewer false alarms on stationary noise.
+        // Pin the qualitative ordering: cps(threshold=2.0) ≤ cps(threshold=1.0).
+        let mut rng = Rng::new(0xCC53);
+        let data: Vec<f64> = (0..2000).map(|_| rng.normal(0.0, 1.0)).collect();
+        let det = BocpdDetector::new(200.0, 350);
+        let cps_low = det.detect_cusum(&data, 0.5, None, 15);
+        let cps_hi = det.detect_cusum(&data, 2.0, None, 15);
+        assert!(
+            cps_hi.len() <= cps_low.len(),
+            "expected FAR monotone in threshold; lo={}, hi={}",
+            cps_low.len(),
+            cps_hi.len()
+        );
+    }
+
+    #[test]
+    fn detect_cusum_multi_regime() {
+        // Three regimes with shifts at known points. CUSUM should fire
+        // near each shift. Loose tolerance (±50) since CUSUM is a
+        // cumulative-evidence rule with longer detection delay than
+        // MAP-drop on small shifts.
+        let mut rng = Rng::new(0xCC54);
+        let mut data: Vec<f64> = (0..200).map(|_| rng.normal(0.0, 1.0)).collect();
+        data.extend((0..200).map(|_| rng.normal(3.0, 1.0)));
+        data.extend((0..200).map(|_| rng.normal(-2.0, 1.0)));
+        let det = BocpdDetector::new(200.0, 350);
+        let cps = det.detect_cusum(&data, 0.5, None, 15);
+        assert!(!cps.is_empty());
+        for truth in [200_usize, 400] {
+            let near = cps.iter().any(|c| (c.index as i64 - truth as i64).abs() < 50);
+            assert!(
+                near,
+                "missed truth {truth}; got {:?}",
+                cps.iter().map(|c| c.index).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn detect_cusum_invalid_threshold_panics() {
+        let det = BocpdDetector::new(200.0, 350);
+        let data = vec![0.0_f64; 100];
+        let result = std::panic::catch_unwind(|| {
+            det.detect_cusum(&data, 0.0, None, 15);
+        });
+        assert!(result.is_err(), "threshold=0 should panic");
+    }
+
+    #[test]
+    fn detect_cusum_short_input_returns_empty() {
+        let det = BocpdDetector::new(200.0, 350);
+        let cps = det.detect_cusum(&[0.0_f64; 10], 1.0, None, 15);
+        assert!(cps.is_empty());
+    }
+
+    #[test]
+    fn detect_cusum_skips_non_finite_samples() {
+        // Same fixture as the existing detect-NaN test: NaN at positions
+        // [5, 10) of 200-bar data with shift at raw index 100. CUSUM
+        // should also fire near 100, not shifted by the 5 NaN gap.
+        let mut rng = Rng::new(0xCC55);
+        let mut data: Vec<f64> = (0..100).map(|_| rng.normal(0.0, 1.0)).collect();
+        data.extend((0..100).map(|_| rng.normal(5.0, 1.0)));
+        for v in data.iter_mut().take(10).skip(5) {
+            *v = f64::NAN;
+        }
+        let det = BocpdDetector::new(200.0, 350);
+        let cps = det.detect_cusum(&data, 0.5, None, 15);
+        assert!(!cps.is_empty());
+        assert!(
+            (cps[0].index as i64 - 100).abs() < 25,
+            "CP should be near raw index 100, got {}",
+            cps[0].index
+        );
+        assert!(
+            cps[0].index >= 95,
+            "index {} too low -- NaN filtering shifted indices",
+            cps[0].index
+        );
+    }
+
+    #[test]
+    fn detect_cusum_high_reference_swallows_signal() {
+        // With reference >> mean(cp_probs | CP), every increment is
+        // negative and the cumsum stays at zero. Pin that this swallows
+        // the CP signal entirely on a clean 5σ shift -- regression-pin
+        // so a future change to default-reference semantics surfaces
+        // here.
+        let mut rng = Rng::new(0xCC56);
+        let mut data: Vec<f64> = (0..150).map(|_| rng.normal(0.0, 1.0)).collect();
+        data.extend((0..150).map(|_| rng.normal(5.0, 1.0)));
+        let det = BocpdDetector::new(200.0, 350);
+        let cps_default = det.detect_cusum(&data, 0.5, None, 15);
+        let cps_high_ref = det.detect_cusum(&data, 1.0, Some(0.9), 15);
+        assert!(
+            !cps_default.is_empty(),
+            "default reference (0) should still detect"
+        );
+        assert!(
+            cps_high_ref.is_empty(),
+            "reference=0.9 should swallow the CP signal entirely; got {:?}",
+            cps_high_ref.iter().map(|c| c.index).collect::<Vec<_>>()
         );
     }
 }
