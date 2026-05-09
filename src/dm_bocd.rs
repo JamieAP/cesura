@@ -407,6 +407,75 @@ mod tests {
     }
 
     #[test]
+    fn first_step_pinned_for_default_prior() {
+        // Default prior μ=0, Σ⁻¹=I. First update with ω=DEFAULT_OMEGA=0.1
+        // gives Σ⁻¹_new = I + 0.2·I = 1.2·I, so each μ_new component is
+        // (1/1.2) · (0 + 0.2·x) = (0.2/1.2)·x = 0.1666…·x. Pin the
+        // closed-form so any future tweak to the streaming update stays
+        // honest.
+        let prior = DmStats::from_prior(&[0.0; 3], &identity_matrix(3));
+        let post = prior.update(&[3.0, 6.0, -9.0], DEFAULT_OMEGA);
+        let factor = 0.2 / 1.2;
+        for (got, want) in post.mu.iter().zip([3.0, 6.0, -9.0].iter()) {
+            assert!((got - factor * want).abs() < 1e-12, "first-step μ drift");
+        }
+        for i in 0..3 {
+            assert!((post.sigma_inv[i][i] - 1.2).abs() < 1e-12);
+            for j in 0..3 {
+                if i != j {
+                    assert!(post.sigma_inv[i][j].abs() < 1e-12);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn long_run_streaming_stays_finite() {
+        // Σ⁻¹ accumulates 2ω·I per step; after T=2000 steps the
+        // diagonal is 1 + 0.2·2000 = 401. Σ becomes ~1/401·I, well
+        // away from numerical underflow. Predictive `Σ + I` is ~I,
+        // so the log_predictive at any reasonable x stays finite.
+        // Pin: no NaN / -inf after 2000 i.i.d. draws.
+        let mut state = DmStats::from_prior(&[0.0, 0.0, 0.0], &identity_matrix(3));
+        let mut prng_state = 0xCAFE_F00D_u64;
+        let mut next_norm = || {
+            // Marsaglia polar method; seeded LCG good enough for a
+            // numerical-stability smoke (no statistical claims).
+            loop {
+                prng_state = prng_state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                let u = (prng_state >> 33) as f64 / (1u64 << 31) as f64;
+                prng_state = prng_state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                let v = (prng_state >> 33) as f64 / (1u64 << 31) as f64;
+                let s = (2.0 * u - 1.0).powi(2) + (2.0 * v - 1.0).powi(2);
+                if s > 0.0 && s < 1.0 {
+                    return (2.0 * u - 1.0) * (-2.0 * s.ln() / s).sqrt();
+                }
+            }
+        };
+        for _ in 0..2_000 {
+            let x = vec![next_norm(), next_norm(), next_norm()];
+            let lp = state.log_predictive(&x);
+            assert!(lp.is_finite(), "log_predictive went non-finite mid-run");
+            state = state.update(&x, DEFAULT_OMEGA);
+        }
+        // Sanity: diagonal grew as expected.
+        assert!(
+            (state.sigma_inv[0][0] - 401.0).abs() < 1e-6,
+            "Σ⁻¹ diag drifted: {}",
+            state.sigma_inv[0][0]
+        );
+        // μ stays bounded (data has unit variance, so posterior mean
+        // shouldn't blow up).
+        for v in &state.mu {
+            assert!(v.abs() < 1.0, "μ blew up: {v}");
+        }
+    }
+
+    #[test]
     fn detect_multivariate_returns_empty_for_short_input() {
         let det = DmBocdDetector::new(2, 100.0, 200);
         assert!(det.detect_multivariate(&[]).is_empty());
