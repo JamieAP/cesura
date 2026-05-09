@@ -20,7 +20,7 @@ use crate::DEFAULT_MASS_CUTOFF;
 /// dimension is degenerate or two dimensions are linearly dependent.
 /// Caller is expected to fall back to per-dim normalisation in that
 /// case rather than panic.
-fn whitening_transform(warmup: &[Vec<f64>], d: usize) -> Option<(Vec<f64>, Vec<Vec<f64>>)> {
+pub(crate) fn whitening_transform(warmup: &[Vec<f64>], d: usize) -> Option<(Vec<f64>, Vec<Vec<f64>>)> {
     let n = warmup.len();
     if n < 2 || d == 0 {
         return None;
@@ -57,7 +57,7 @@ fn whitening_transform(warmup: &[Vec<f64>], d: usize) -> Option<(Vec<f64>, Vec<V
 #[allow(clippy::needless_range_loop)]
 /// Cholesky factor `L` such that `L · Lᵀ = A`, lower-triangular.
 /// Returns `None` if `A` is not positive-definite.
-fn cholesky_lower(a: &[Vec<f64>]) -> Option<Vec<Vec<f64>>> {
+pub(crate) fn cholesky_lower(a: &[Vec<f64>]) -> Option<Vec<Vec<f64>>> {
     let d = a.len();
     let mut l = vec![vec![0.0; d]; d];
     for i in 0..d {
@@ -82,7 +82,7 @@ fn cholesky_lower(a: &[Vec<f64>]) -> Option<Vec<Vec<f64>>> {
 
 /// Solve `L · y = b` for `y` via forward substitution. `L` must be
 /// lower-triangular with non-zero diagonal.
-fn forward_solve(l: &[Vec<f64>], b: &[f64]) -> Vec<f64> {
+pub(crate) fn forward_solve(l: &[Vec<f64>], b: &[f64]) -> Vec<f64> {
     let d = b.len();
     let mut y = vec![0.0; d];
     for i in 0..d {
@@ -96,7 +96,7 @@ fn forward_solve(l: &[Vec<f64>], b: &[f64]) -> Vec<f64> {
 }
 
 /// Per-dimension z-normalisation fallback for `detect_multivariate`.
-fn per_dim_znorm(data: &[Vec<f64>], d: usize, n: usize) -> Vec<Vec<f64>> {
+pub(crate) fn per_dim_znorm(data: &[Vec<f64>], d: usize, n: usize) -> Vec<Vec<f64>> {
     let mut means = vec![0.0; d];
     let mut stds = vec![0.0; d];
     for dim in 0..d {

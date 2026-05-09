@@ -29,6 +29,7 @@ pub mod auto_q0;
 pub mod chen_wu;
 pub mod conformal;
 pub mod detrend;
+pub mod dm_bocd;
 pub mod ensemble;
 #[cfg(any(test, feature = "test-utils"))]
 pub mod eval;
@@ -45,6 +46,7 @@ mod bocpd;
 mod math;
 mod nig;
 
+pub use dm_bocd::DmBocdDetector;
 pub use bocpd::BocpdDetector;
 pub use conformal::{ConformalCp, ConformalCpWrapper, MvScoredDetect, ScoredDetect};
 pub use ensemble::EnsembleDetector;
