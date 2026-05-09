@@ -8,7 +8,7 @@
 //! supposed to win on.
 
 use cesura::eval::Rng;
-use cesura::{BocpdDetector, DmBocdDetector};
+use cesura::{BocpdDetector, ConformalCpWrapper, DmBocdDetector};
 
 /// Two-regime, anti-correlated 1σ shift on d=2 with ρ=0.95.
 /// This is the fixture the joint-whitening MV path is supposed to
@@ -138,4 +138,41 @@ fn builder_chain_smoke() {
 
     let cps = det.detect_multivariate(&data);
     assert!(!cps.is_empty(), "builder-chained detector failed to fire");
+}
+
+/// Conformal compat: `DmBocdDetector` impls `MvScoredDetect`, so the
+/// rolling-quantile timing-interval wrapper composes over it the same
+/// way it does over `BocpdDetector`. Pin: emission-count parity between
+/// raw `detect_multivariate` and `ConformalCpWrapper::detect_multivariate`.
+#[test]
+fn mv_scored_detect_impl_composes_with_conformal_wrapper() {
+    let mut rng = Rng::new(0x60CC_AB1E);
+    let mut data: Vec<Vec<f64>> = (0..200)
+        .map(|_| vec![rng.normal(0.0, 1.0), rng.normal(0.0, 1.0)])
+        .collect();
+    data.extend((0..200).map(|_| vec![rng.normal(3.0, 1.0), rng.normal(-3.0, 1.0)]));
+    data.extend((0..200).map(|_| vec![rng.normal(0.0, 1.0), rng.normal(0.0, 1.0)]));
+
+    let det = DmBocdDetector::new(2, 200.0, 700);
+    let raw = det.detect_multivariate(&data);
+    let scored = det.detect_multivariate_with_score(&data);
+    assert_eq!(
+        raw.len(),
+        scored.len(),
+        "with_score must emit one (cp, score) per cp"
+    );
+    assert!(scored.iter().all(|(_, s)| s.is_finite() && *s >= 0.0));
+
+    let mut wrapped = ConformalCpWrapper::new(DmBocdDetector::new(2, 200.0, 700))
+        .with_calibration_capacity(50)
+        .with_coverage(0.9);
+    let conformal = wrapped.detect_multivariate(&data);
+    assert_eq!(
+        conformal.len(),
+        raw.len(),
+        "wrapper must preserve raw emission count"
+    );
+    let raw_idx: Vec<usize> = raw.iter().map(|c| c.index).collect();
+    let conf_idx: Vec<usize> = conformal.iter().map(|c| c.cp.index).collect();
+    assert_eq!(raw_idx, conf_idx, "wrapper must preserve emission indices");
 }

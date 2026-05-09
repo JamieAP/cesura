@@ -20,6 +20,7 @@
 //!
 
 use crate::bocpd::{cholesky_lower, forward_solve, per_dim_znorm, whitening_transform};
+use crate::conformal::MvScoredDetect;
 use crate::log_add_exp;
 use crate::ChangePoint;
 use crate::DEFAULT_MASS_CUTOFF;
@@ -104,6 +105,18 @@ impl DmBocdDetector {
     /// Returns an empty vec for `n < 20`, `d == 0`, ragged rows, or
     /// observation dimensionality mismatching the constructor's `d`.
     pub fn detect_multivariate(&self, data: &[Vec<f64>]) -> Vec<ChangePoint> {
+        self.detect_multivariate_with_score(data)
+            .into_iter()
+            .map(|(cp, _score)| cp)
+            .collect()
+    }
+
+    /// Same as [`Self::detect_multivariate`] but each emission carries
+    /// a scalar score for [`crate::ConformalCpWrapper`]. Score is the
+    /// trigger-step displacement from BOCPD's MAP-collapse argmax in
+    /// the cooldown lookback window: `score = (i - peak_idx) as f64`.
+    /// Same step-unit convention as `BocpdDetector::detect_multivariate_with_score`.
+    pub fn detect_multivariate_with_score(&self, data: &[Vec<f64>]) -> Vec<(ChangePoint, f64)> {
         let n = data.len();
         if n < 20 {
             return vec![];
@@ -224,11 +237,21 @@ impl DmBocdDetector {
                     .unwrap_or(0);
                 if prev_max >= min_prev_rl {
                     let look_back = cooldown.min(i);
-                    let confidence = cp_probs[i.saturating_sub(look_back)..=i]
+                    let window_start = i - look_back;
+                    let confidence = cp_probs[window_start..=i]
                         .iter()
                         .copied()
                         .fold(0.0_f64, f64::max)
                         .clamp(0.0, 1.0);
+                    let mut peak_idx = i;
+                    let mut peak_val = cp_probs[i];
+                    for (k, &p) in cp_probs.iter().enumerate().take(i + 1).skip(window_start) {
+                        if p > peak_val {
+                            peak_val = p;
+                            peak_idx = k;
+                        }
+                    }
+                    let score = (i - peak_idx) as f64;
                     let w = 20;
                     let before = &norm[i.saturating_sub(w)..i];
                     let after = &norm[i..(i + w).min(n)];
@@ -250,7 +273,7 @@ impl DmBocdDetector {
                         continue;
                     }
                     last_detection = i;
-                    result.push(ChangePoint { index: i, confidence, shift_sigma });
+                    result.push((ChangePoint { index: i, confidence, shift_sigma }, score));
                     i += cooldown;
                     continue;
                 }
@@ -258,6 +281,15 @@ impl DmBocdDetector {
             i += 1;
         }
         result
+    }
+}
+
+impl MvScoredDetect for DmBocdDetector {
+    fn detect_multivariate_with_score(
+        &self,
+        data: &[Vec<f64>],
+    ) -> Vec<(ChangePoint, f64)> {
+        DmBocdDetector::detect_multivariate_with_score(self, data)
     }
 }
 
@@ -437,27 +469,9 @@ mod tests {
         // so the log_predictive at any reasonable x stays finite.
         // Pin: no NaN / -inf after 2000 i.i.d. draws.
         let mut state = DmStats::from_prior(&[0.0, 0.0, 0.0], &identity_matrix(3));
-        let mut prng_state = 0xCAFE_F00D_u64;
-        let mut next_norm = || {
-            // Marsaglia polar method; seeded LCG good enough for a
-            // numerical-stability smoke (no statistical claims).
-            loop {
-                prng_state = prng_state
-                    .wrapping_mul(6364136223846793005)
-                    .wrapping_add(1442695040888963407);
-                let u = (prng_state >> 33) as f64 / (1u64 << 31) as f64;
-                prng_state = prng_state
-                    .wrapping_mul(6364136223846793005)
-                    .wrapping_add(1442695040888963407);
-                let v = (prng_state >> 33) as f64 / (1u64 << 31) as f64;
-                let s = (2.0 * u - 1.0).powi(2) + (2.0 * v - 1.0).powi(2);
-                if s > 0.0 && s < 1.0 {
-                    return (2.0 * u - 1.0) * (-2.0 * s.ln() / s).sqrt();
-                }
-            }
-        };
+        let mut rng = crate::eval::Rng::new(0xCAFE_F00D);
         for _ in 0..2_000 {
-            let x = vec![next_norm(), next_norm(), next_norm()];
+            let x: Vec<f64> = (0..3).map(|_| rng.normal(0.0, 1.0)).collect();
             let lp = state.log_predictive(&x);
             assert!(lp.is_finite(), "log_predictive went non-finite mid-run");
             state = state.update(&x, DEFAULT_OMEGA);
