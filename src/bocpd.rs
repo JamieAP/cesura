@@ -878,6 +878,123 @@ impl<P: Predictive> BocpdDetector<P> {
         out
     }
 
+    /// Offline twin of [`crate::streaming::StreamingDetector::with_bayes_factor_quantile_rule`].
+    ///
+    /// Same recursion as [`Self::detect_bayes_factor`], but the firing
+    /// threshold is the empirical `quantile`-th quantile of a sliding
+    /// window of `window` past BF values. During warmup (window not
+    /// full), uses `fallback_threshold` so the detector still emits if
+    /// the stream produces an early outlier. The window is updated
+    /// *after* the per-step fire decision so the current BF never
+    /// participates in its own reference distribution.
+    ///
+    /// # Panics
+    /// Panics if `fallback_threshold <= 0`, `quantile` ∉ (0, 1), or
+    /// `window == 0`.
+    pub fn detect_bayes_factor_quantile(
+        &self,
+        data: &[f64],
+        fallback_threshold: f64,
+        short_horizon: usize,
+        cooldown: usize,
+        quantile: f64,
+        window: usize,
+    ) -> Vec<ChangePoint> {
+        assert!(
+            fallback_threshold > 0.0,
+            "fallback_threshold must be > 0, got {fallback_threshold}"
+        );
+        assert!(
+            quantile > 0.0 && quantile < 1.0,
+            "quantile must be in (0, 1), got {quantile}"
+        );
+        assert!(window > 0, "window must be > 0");
+        let Some((norm, _map_rls, cp_probs, short_mass, original_indices)) =
+            self.run_recursion(data, short_horizon)
+        else {
+            return Vec::new();
+        };
+        let n = norm.len();
+
+        let mut out = Vec::new();
+        let mut last_emit: Option<usize> = None;
+        let mut armed = false;
+        let mut recent: std::collections::VecDeque<f64> =
+            std::collections::VecDeque::with_capacity(window);
+
+        for (t, &sm) in short_mass.iter().enumerate() {
+            if let Some(last) = last_emit {
+                if t.saturating_sub(last) <= cooldown {
+                    continue;
+                }
+            }
+            let long_mass = (1.0 - sm).max(1e-12);
+            let bf = sm / long_mass;
+            if !armed {
+                if bf < 1.0 {
+                    armed = true;
+                }
+                continue;
+            }
+            let active_threshold = if recent.len() >= window {
+                let mut v: Vec<f64> =
+                    recent.iter().copied().filter(|x| x.is_finite()).collect();
+                if v.is_empty() {
+                    fallback_threshold
+                } else {
+                    v.sort_by(|a, b| a.total_cmp(b));
+                    let pos = quantile * (v.len() - 1) as f64;
+                    let lo = pos.floor() as usize;
+                    let hi = pos.ceil() as usize;
+                    if lo == hi {
+                        v[lo]
+                    } else {
+                        let frac = pos - lo as f64;
+                        v[lo] * (1.0 - frac) + v[hi] * frac
+                    }
+                }
+            } else {
+                fallback_threshold
+            };
+            if bf > active_threshold {
+                let look_back = cooldown.min(t);
+                let confidence = cp_probs[t.saturating_sub(look_back)..=t]
+                    .iter()
+                    .copied()
+                    .fold(0.0_f64, f64::max)
+                    .clamp(0.0, 1.0);
+                let w = 20;
+                let before = &norm[t.saturating_sub(w)..t];
+                let after = &norm[t..(t + w).min(n)];
+                let mean_b = if before.is_empty() {
+                    0.0
+                } else {
+                    before.iter().sum::<f64>() / before.len() as f64
+                };
+                let mean_a = if after.is_empty() {
+                    0.0
+                } else {
+                    after.iter().sum::<f64>() / after.len() as f64
+                };
+                let shift_sigma = (mean_a - mean_b).abs();
+                if shift_sigma >= 1e-9 {
+                    out.push(ChangePoint {
+                        index: original_indices[t],
+                        confidence,
+                        shift_sigma,
+                    });
+                    last_emit = Some(t);
+                    armed = false;
+                }
+            }
+            recent.push_back(bf);
+            while recent.len() > window {
+                recent.pop_front();
+            }
+        }
+        out
+    }
+
     pub(crate) fn detect_with_score(&self, data: &[f64]) -> Vec<(ChangePoint, f64)> {
         let mut original_indices: Vec<usize> = Vec::new();
         let data: Vec<f64> = data
@@ -2382,6 +2499,21 @@ mod tests {
             (cps[0].index as i64 - 150).abs() < 25,
             "first CP at {} too far from truth 150",
             cps[0].index
+        );
+    }
+
+    #[test]
+    fn detect_bayes_factor_quantile_clean_shift() {
+        // Offline twin of streaming_bf_quantile_fires_on_real_outlier.
+        let mut rng = Rng::new(0xBF52);
+        let mut data: Vec<f64> = (0..200).map(|_| rng.normal(0.0, 1.0)).collect();
+        data.extend((0..150).map(|_| rng.normal(5.0, 1.0)));
+        let det = BocpdDetector::new(200.0, 350);
+        let cps = det.detect_bayes_factor_quantile(&data, 2.0, 3, 15, 0.99, 100);
+        assert!(!cps.is_empty(), "quantile twin must detect a clean 5σ shift");
+        assert!(
+            cps.iter().any(|c| (c.index as i64 - 200).abs() < 40),
+            "no CP near shift step 200, got {cps:?}"
         );
     }
 

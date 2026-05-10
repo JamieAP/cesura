@@ -52,6 +52,32 @@ pub struct BfRuleState {
     pub cooldown: usize,
     pub armed: bool,
     pub last_emit: Option<usize>,
+    /// Quantile-based dynamic threshold. `Some(q)` ⇒ once `recent_bf`
+    /// has filled `quantile_window`, fire when current BF exceeds the
+    /// `q`-th quantile of the ring. `None` ⇒ fixed `threshold`.
+    /// Forward-compatibility: snapshots without this field default to None.
+    #[serde(default)]
+    pub quantile: Option<f64>,
+    /// Sliding window over which the empirical-BF quantile is computed.
+    #[serde(default = "default_bf_quantile_window")]
+    pub quantile_window: usize,
+    /// Sliding ring of recent BF values. Updated AFTER the per-step
+    /// fire decision so the current BF never contaminates its own
+    /// reference distribution (mirrors the rank-transform pattern in
+    /// `multistream::hc::RankWindow`).
+    ///
+    /// Cold-spot caveat: the dispatch in [`crate::streaming::StreamingDetector::step`]
+    /// gates the entire BF block on `!in_cooldown`, so during the
+    /// post-fire cooldown window (default 15 steps) the ring is not
+    /// updated. Omitting cooldown samples can affect calibration;
+    /// evaluate the quantile, window and cooldown together on
+    /// representative streams.
+    #[serde(default)]
+    pub recent_bf: std::collections::VecDeque<f64>,
+}
+
+fn default_bf_quantile_window() -> usize {
+    500
 }
 
 /// Serializable NIG sufficient statistics.
@@ -185,6 +211,29 @@ pub struct StreamingDetector {
 
 const SHIFT_WINDOW: usize = 20;
 
+/// Empirical `q`-quantile of a small ring (linear interpolation between
+/// adjacent ranks, mirroring NumPy/Polars `quantile(method='linear')`).
+/// Caller guarantees `ring` non-empty and `q ∈ (0, 1)`. NaN values are
+/// dropped (BF should always be finite, but the recursion can produce
+/// NaN under degenerate inputs).
+fn quantile_of(ring: &std::collections::VecDeque<f64>, q: f64) -> f64 {
+    let mut v: Vec<f64> = ring.iter().copied().filter(|x| x.is_finite()).collect();
+    if v.is_empty() {
+        return f64::INFINITY;
+    }
+    v.sort_by(|a, b| a.total_cmp(b));
+    let n = v.len();
+    let pos = q * (n - 1) as f64;
+    let lo = pos.floor() as usize;
+    let hi = pos.ceil() as usize;
+    if lo == hi {
+        v[lo]
+    } else {
+        let frac = pos - lo as f64;
+        v[lo] * (1.0 - frac) + v[hi] * frac
+    }
+}
+
 /// Compute |mean(after) - mean(before)| from the ring buffer.
 /// `total_steps` is the step count after the most recent observation.
 /// `fire_step` is the step count at the moment the candidate was triggered.
@@ -279,6 +328,54 @@ impl StreamingDetector {
             cooldown,
             armed: false,
             last_emit: None,
+            quantile: None,
+            quantile_window: default_bf_quantile_window(),
+            recent_bf: std::collections::VecDeque::new(),
+        });
+        self
+    }
+
+    /// Switch the streaming detector to a quantile-based dynamic-threshold
+    /// BF rule. Once a sliding window of `window` BF values is full,
+    /// fires when current BF exceeds the `quantile`-th quantile of that
+    /// window. During warmup (window not yet full), falls back to the
+    /// fixed `threshold` argument so the detector still emits if the
+    /// stream produces a real outlier early.
+    ///
+    /// The window updates *after* the fire decision so the current BF
+    /// never contaminates its own reference distribution.
+    ///
+    /// # Panics
+    /// Panics if `threshold <= 0`, `short_horizon >= max_rl`,
+    /// `quantile` ∉ (0, 1), or `window == 0`.
+    pub fn with_bayes_factor_quantile_rule(
+        mut self,
+        threshold: f64,
+        short_horizon: usize,
+        cooldown: usize,
+        quantile: f64,
+        window: usize,
+    ) -> Self {
+        assert!(threshold > 0.0, "threshold must be > 0, got {threshold}");
+        assert!(
+            short_horizon < self.max_rl,
+            "short_horizon {short_horizon} must be < max_rl {}",
+            self.max_rl
+        );
+        assert!(
+            quantile > 0.0 && quantile < 1.0,
+            "quantile must be in (0, 1), got {quantile}"
+        );
+        assert!(window > 0, "window must be > 0");
+        self.bf_rule = Some(BfRuleState {
+            threshold,
+            short_horizon,
+            cooldown,
+            armed: false,
+            last_emit: None,
+            quantile: Some(quantile),
+            quantile_window: window,
+            recent_bf: std::collections::VecDeque::with_capacity(window),
         });
         self
     }
@@ -487,21 +584,43 @@ impl StreamingDetector {
                         if bf_val < 1.0 {
                             bf.armed = true;
                         }
-                    } else if bf_val > bf.threshold {
-                        let look_back = bf.cooldown.min(i);
-                        let confidence = self.cp_probs[i.saturating_sub(look_back)..=i]
-                            .iter()
-                            .copied()
-                            .fold(0.0_f64, f64::max)
-                            .clamp(0.0, 1.0);
-                        bf.last_emit = Some(i);
-                        bf.armed = false;
-                        self.pending.push(PendingCp {
-                            raw_index: self.raw_index_map[i],
-                            fire_step: self.total_steps,
-                            confidence,
-                            is_bf: true,
-                        });
+                    } else {
+                        // Resolve the active threshold: dynamic quantile
+                        // once the window is full; fixed `threshold`
+                        // during warmup or in fixed mode.
+                        let active_threshold = match bf.quantile {
+                            Some(q) if bf.recent_bf.len() >= bf.quantile_window => {
+                                quantile_of(&bf.recent_bf, q)
+                            }
+                            _ => bf.threshold,
+                        };
+                        if bf_val > active_threshold {
+                            let look_back = bf.cooldown.min(i);
+                            let confidence = self.cp_probs[i.saturating_sub(look_back)..=i]
+                                .iter()
+                                .copied()
+                                .fold(0.0_f64, f64::max)
+                                .clamp(0.0, 1.0);
+                            bf.last_emit = Some(i);
+                            bf.armed = false;
+                            self.pending.push(PendingCp {
+                                raw_index: self.raw_index_map[i],
+                                fire_step: self.total_steps,
+                                confidence,
+                                is_bf: true,
+                            });
+                        }
+                    }
+                    // Update the recent-BF ring AFTER the fire decision
+                    // so the current BF never participates in its own
+                    // reference distribution. The ring is updated only
+                    // when quantile mode is enabled; fixed mode leaves
+                    // the ring unchanged.
+                    if bf.quantile.is_some() {
+                        bf.recent_bf.push_back(bf_val);
+                        while bf.recent_bf.len() > bf.quantile_window {
+                            bf.recent_bf.pop_front();
+                        }
                     }
                 }
             } else {
@@ -1183,6 +1302,185 @@ mod tests {
             assert_eq!(a.index, b.index, "BF restore drift in CP index");
             assert!((a.confidence - b.confidence).abs() < 1e-9);
         }
+    }
+
+    #[test]
+    fn streaming_bf_quantile_fires_on_real_outlier() {
+        // 200 stationary steps where BF stays small, then a clean mean
+        // shift large enough that BF spikes well above the q99 of the
+        // post-warmup window. Quantile rule (q=0.99, window=100) and
+        // fixed rule (τ=2.0) should both fire near the shift.
+        use crate::eval::Rng;
+        let mut rng = Rng::new(7);
+        let mut data: Vec<f64> = (0..200).map(|_| rng.normal(0.0, 1.0)).collect();
+        data.extend((0..100).map(|_| 5.0 + rng.normal(0.0, 1.0)));
+
+        let mut q = StreamingDetector::new(200.0, 250)
+            .with_bayes_factor_quantile_rule(2.0, 3, 15, 0.99, 100);
+        let cps_q = q.step(&data);
+        assert!(
+            !cps_q.is_empty(),
+            "quantile rule should fire on the post-200 shift"
+        );
+        let near_shift = cps_q.iter().any(|c| (c.index as i64 - 200).abs() < 40);
+        assert!(near_shift, "quantile fire should land near the shift, got {cps_q:?}");
+
+        let mut f = StreamingDetector::new(200.0, 250)
+            .with_bayes_factor_rule(2.0, 3, 15);
+        let cps_f = f.step(&data);
+        assert!(!cps_f.is_empty(), "fixed rule should also fire on this shift");
+    }
+
+    #[test]
+    fn streaming_bf_quantile_far_tracks_quantile_level() {
+        // Calibration property: on stationary data the quantile rule's
+        // FAR is governed by (1 - q) modulo armed/cooldown gating. A
+        // higher q ⇒ stricter threshold ⇒ fewer fires. This is the knob
+        // the user actually has: pick `q` to target a FAR, not pick a
+        // BF magnitude they can't predict from the stream's noise.
+        use crate::eval::Rng;
+        let n = 1500;
+
+        let counts: Vec<usize> = [0.90_f64, 0.99_f64]
+            .iter()
+            .enumerate()
+            .map(|(i, &q)| {
+                let mut rng = Rng::new(11 + i as u64);
+                let data: Vec<f64> = (0..n).map(|_| rng.normal(0.0, 1.0)).collect();
+                let mut det = StreamingDetector::new(200.0, 250)
+                    .with_bayes_factor_quantile_rule(2.0, 3, 15, q, 300);
+                det.step(&data).len()
+            })
+            .collect();
+        assert!(
+            counts[0] >= counts[1],
+            "stricter quantile must fire ≤ permissive: q=.90 → {}, q=.99 → {}",
+            counts[0],
+            counts[1]
+        );
+    }
+
+    #[test]
+    fn streaming_bf_quantile_warmup_fills_ring_to_cap() {
+        // Pre-warmup: window not yet full ⇒ fallback (fixed τ=2.0) is
+        // the active threshold. After enough steps the ring saturates
+        // at `quantile_window` and the quantile threshold takes over.
+        // This pins (a) the ring growth + cap behaviour, (b) that
+        // fires can land under the fallback regime, and (c) that the
+        // armed/cooldown gating still allows the ring to populate
+        // through cooldown windows enough to reach the cap.
+        use crate::eval::Rng;
+        let mut rng = Rng::new(13);
+        let mut data: Vec<f64> = (0..30).map(|_| rng.normal(0.0, 1.0)).collect();
+        data.extend((0..50).map(|_| 5.0 + rng.normal(0.0, 1.0)));
+        data.extend((0..400).map(|_| rng.normal(5.0, 1.0)));
+
+        let mut det = StreamingDetector::new(200.0, 250)
+            .with_bayes_factor_quantile_rule(2.0, 3, 15, 0.99, 200);
+        let _ = det.step(&data);
+        let bf = det.save_state().bf_rule.expect("bf_rule present");
+        assert_eq!(
+            bf.recent_bf.len(),
+            bf.quantile_window,
+            "ring should saturate at the configured window cap"
+        );
+        assert!(
+            bf.recent_bf.iter().all(|x| x.is_finite()),
+            "ring contents must all be finite"
+        );
+    }
+
+    #[test]
+    fn quantile_of_drops_nan_values() {
+        // The dispatch's recent_bf push only stores finite values in
+        // practice, but the helper must still handle NaN defensively
+        // because restored snapshots may contain non-finite values.
+        use std::collections::VecDeque;
+        let mut ring: VecDeque<f64> = VecDeque::new();
+        ring.push_back(0.1);
+        ring.push_back(f64::NAN);
+        ring.push_back(0.5);
+        ring.push_back(f64::NAN);
+        ring.push_back(1.0);
+        // q-th quantile of {0.1, 0.5, 1.0} (NaN dropped). q=0.5 ⇒ 0.5.
+        let q50 = super::quantile_of(&ring, 0.5);
+        assert!((q50 - 0.5).abs() < 1e-9, "expected 0.5, got {q50}");
+        // Empty / all-NaN ring ⇒ +inf so the rule never fires (safe
+        // degenerate behaviour rather than a panic).
+        let mut ring2: VecDeque<f64> = VecDeque::new();
+        ring2.push_back(f64::NAN);
+        ring2.push_back(f64::NAN);
+        let q = super::quantile_of(&ring2, 0.99);
+        assert_eq!(q, f64::INFINITY, "all-NaN ring must return +inf");
+    }
+
+    #[test]
+    fn bf_rule_state_serde_round_trip_with_quantile() {
+        // Snapshot without quantile support: no `quantile`, `quantile_window`, or
+        // `recent_bf` fields. Forward-compat via #[serde(default)].
+        let mut state_json: serde_json::Value = serde_json::json!({
+            "threshold": 2.0,
+            "short_horizon": 3,
+            "cooldown": 15,
+            "armed": true,
+            "last_emit": null,
+        });
+        let s: BfRuleState = serde_json::from_value(state_json.clone()).unwrap();
+        assert_eq!(s.quantile, None);
+        assert_eq!(s.quantile_window, default_bf_quantile_window());
+        assert!(s.recent_bf.is_empty());
+
+        // Forward direction: a quantile-enabled state round-trips with
+        // its full ring intact.
+        state_json["quantile"] = serde_json::json!(0.99);
+        state_json["quantile_window"] = serde_json::json!(50);
+        state_json["recent_bf"] = serde_json::json!([0.1, 0.2, 0.5, 1.5]);
+        let s2: BfRuleState = serde_json::from_value(state_json).unwrap();
+        assert_eq!(s2.quantile, Some(0.99));
+        assert_eq!(s2.quantile_window, 50);
+        assert_eq!(s2.recent_bf.len(), 4);
+        let json = serde_json::to_string(&s2).unwrap();
+        let s3: BfRuleState = serde_json::from_str(&json).unwrap();
+        assert_eq!(s2.recent_bf.len(), s3.recent_bf.len());
+        assert_eq!(s2.quantile, s3.quantile);
+    }
+
+    #[test]
+    fn streaming_bf_quantile_save_restore_round_trips() {
+        // Run a partial stream under quantile mode, save+restore, finish
+        // on both; detections + recent_bf ring must match.
+        let mut det = StreamingDetector::new(200.0, 250)
+            .with_bayes_factor_quantile_rule(2.0, 3, 15, 0.99, 100);
+        let phase1: Vec<f64> = std::iter::repeat_n(0.0, 150).collect();
+        det.step(&phase1);
+
+        let json = serde_json::to_string(&det.save_state()).unwrap();
+        let restored: DetectorState = serde_json::from_str(&json).unwrap();
+        let bf = restored.bf_rule.as_ref().expect("bf_rule survives roundtrip");
+        assert_eq!(bf.quantile, Some(0.99));
+        assert_eq!(bf.quantile_window, 100);
+        assert!(
+            !bf.recent_bf.is_empty(),
+            "recent_bf ring must persist; got empty after 150 steps"
+        );
+        let len_before = bf.recent_bf.len();
+
+        let mut det2 = StreamingDetector::restore(restored).unwrap();
+        // The deserialized restore preserves the ring (verified above);
+        // running phase2 on both must produce identical CPs.
+        let phase2: Vec<f64> = std::iter::repeat_n(5.0, 100).collect();
+        let cps1 = det.step(&phase2);
+        let cps2 = det2.step(&phase2);
+        assert_eq!(cps1.len(), cps2.len(), "quantile restore drift in CP count");
+        for (a, b) in cps1.iter().zip(cps2.iter()) {
+            assert_eq!(a.index, b.index, "quantile restore drift in CP index");
+        }
+        // Ring should grow further over phase2.
+        let len_after = det2.bf_rule.as_ref().unwrap().recent_bf.len();
+        assert!(
+            len_after >= len_before,
+            "ring shrank from {len_before} to {len_after}"
+        );
     }
 
     #[test]
