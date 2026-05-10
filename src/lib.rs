@@ -41,6 +41,9 @@ pub mod niw;
 pub mod predictive;
 pub mod pro_bocd;
 pub mod streaming;
+
+#[cfg(feature = "test-utils")]
+pub mod canonical;
 #[cfg(feature = "joint-detection")]
 pub mod streaming_chen_wu;
 pub mod multistream;
