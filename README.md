@@ -169,6 +169,58 @@ The detector ships in the default feature set (`feature = "joint-detection"`,
 default-on as of 0.8). Disable via `default-features = false` if you
 only want the BOCPD path.
 
+## Multivariate Dm-BOCD
+
+For joint-stream regime detection (e.g., d=3 BTC/ETH/SOL hourly,
+d=4 SPX/NDX/DJI/VIX hourly), `DmBocdDetector<M>` runs a Dm-posterior
+on the segment mean instead of the iid NIG predictive. The
+m-function `M` parameterises the within-regime weighting:
+
+- `IdentityM` -- uniform weight (closed-form Dm posterior).
+- `ImqM::new(c)` -- inverse-multiquadric kernel, robust against
+  heavy-tailed residuals.
+- `AdaptiveImqM::new(α)` -- ST-RCGP-style adaptive bandwidth via
+  per-segment posterior covariance.
+
+```rust
+use cesura::dm_bocd::{DmBocdDetector, IdentityM, ImqM, AdaptiveImqM};
+
+let det = DmBocdDetector::new(/*d=*/4, /*lambda=*/720.0, /*max_rl=*/256)
+    .with_m_weight(ImqM::new(1.0));
+
+let cps = det.detect_multivariate(&data);  // Vec<ChangePoint>
+```
+
+```rust
+use cesura::dm_bocd::StreamingDmBocd;
+
+let mut s = StreamingDmBocd::new(4, 720.0, 256);
+for bar in stream { s.step(&bar); }  // 20-bar latency
+```
+
+## Bench harness -- apples-to-apples by construction
+
+Every detector ships with an adapter into `src/bench/`. The
+`BenchAuditTrail` builder is the canonical pipeline: build
+fixtures, build detectors, loop, dump JSON reports, render a
+markdown table with a `classify_verdict` banner. The verdict
+floor is `n_events ≥ 50` -- below that, anything classifies as a
+sanity check, not a verdict-grade read.
+
+```rust
+use cesura::bench::{BenchAuditTrail, FixtureRegistry};
+use cesura::bench::adapters::DmBocdAdapter;
+
+let fix = FixtureRegistry::indices_macro_v1(&[])?;
+let det = DmBocdDetector::new(fix.d, 720.0, 256);
+let adapter = DmBocdAdapter { det: &det, label: "Dm-Identity" };
+
+let mut audit = BenchAuditTrail::new(Path::new("bench/results"), "intro");
+audit.run(&adapter, &fix);
+let mut out = String::new();
+audit.render(&mut out);
+```
+
 ## Known limitations
 
 ## References
