@@ -40,12 +40,23 @@ pub struct Report {
     pub attribution: Vec<Vec<usize>>,
 }
 
-pub fn run_bench<D: CpDetector + ?Sized>(d: &D, fix: &Fixture) -> Report {
+/// Run a single (detector, fixture) cell. Returns the aggregated
+/// `Report` (suitable for JSON dump) AND the live `DetectionResult`
+/// for in-process rendering of per-CP detail (confidence, attribution
+/// names) the aggregate cannot carry.
+///
+/// `Report.attribution` mirrors `result.attribution` so the JSON
+/// dump alone is sufficient for downstream replays; the second tuple
+/// element is just-don't-redo-detection convenience for the caller.
+pub fn run_bench<D: CpDetector + ?Sized>(
+    d: &D,
+    fix: &Fixture,
+) -> (Report, crate::bench::DetectionResult) {
     let t0 = Instant::now();
     let result = d.detect_full(fix);
     let timing_us = t0.elapsed().as_micros();
     let metrics = evaluate(&result.cps, fix);
-    Report {
+    let report = Report {
         detector: d.name(),
         fixture: fix.name.clone(),
         fixture_version: fix.version,
@@ -57,8 +68,9 @@ pub fn run_bench<D: CpDetector + ?Sized>(d: &D, fix: &Fixture) -> Report {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0),
-        attribution: result.attribution,
-    }
+        attribution: result.attribution.clone(),
+    };
+    (report, result)
 }
 
 /// Writes one report to `<dir>/<fixture>/<detector>-<commit>.json`.
@@ -112,6 +124,44 @@ pub fn render_markdown(reports: &[Report]) -> String {
             m.f1,
             m.far,
             r.timing_us,
+        ));
+    }
+    s
+}
+
+/// Per-fire attribution row for markdown rendering. Streams are
+/// pre-resolved to display names by the caller (numeric stream
+/// index → asset name happens at the example layer, since fixture
+/// → asset-name mapping is fixture-specific).
+#[derive(Debug, Clone)]
+pub struct AttributionRow {
+    pub detector: String,
+    pub fixture: String,
+    pub fire_idx: usize,
+    pub cp_index: usize,
+    pub confidence: f64,
+    pub streams: Vec<String>,
+}
+
+/// Render the per-stream attribution table. Fires with empty streams
+/// (univariate / sum-CUSUM) are skipped by the caller before passing
+/// rows in. Empty `rows` slice produces an empty string.
+pub fn render_attribution(rows: &[AttributionRow]) -> String {
+    if rows.is_empty() {
+        return String::new();
+    }
+    let mut s = String::new();
+    s.push_str("| detector | fixture | fire_idx | cp_index | confidence | streams |\n");
+    s.push_str("|---|---|---:|---:|---:|---|\n");
+    for row in rows {
+        s.push_str(&format!(
+            "| {} | {} | {} | {} | {:.3} | {} |\n",
+            row.detector,
+            row.fixture,
+            row.fire_idx,
+            row.cp_index,
+            row.confidence,
+            row.streams.join(", "),
         ));
     }
     s

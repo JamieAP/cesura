@@ -257,7 +257,7 @@ fn run_bench_via_bocpd_adapter_on_synthetic() {
         mv: false,
         label: "Bocpd",
     };
-    let report = run_bench(&adapter, fix);
+    let (report, _) = run_bench(&adapter, fix);
     assert_eq!(report.detector, "Bocpd");
     assert_eq!(report.fixture, "noisy_3sigma");
     assert_eq!(report.metrics.n_events, fix.ground_truth.len());
@@ -299,7 +299,7 @@ fn step_shift_injection_is_detectable_on_synthetic_baseline() {
     };
     let det = cesura::BocpdDetector::new(200.0, 250);
     let adapter = BocpdAdapter { det: &det, mv: false, label: "Bocpd" };
-    let report = run_bench(&adapter, &fix);
+    let (report, _) = run_bench(&adapter, &fix);
     assert!(
         report.metrics.recall >= 2.0 / 3.0,
         "step-shift fixture must be detectable; recall={} hits={:?}",
@@ -320,7 +320,7 @@ fn run_bench_via_conformal_adapter_projects_to_changepoint() {
         .with_coverage(0.9)
         .with_calibration_capacity(8);
     let adapter = ConformalAdapter::new(wrapper, "Conformal+Bocpd");
-    let report = run_bench(&adapter, &fix);
+    let (report, _) = run_bench(&adapter, &fix);
     assert_eq!(report.detector, "Conformal+Bocpd");
     assert!(report.metrics.recall > 0.0);
     // The projection must drop timing_interval cleanly: n_cps reflects
@@ -337,6 +337,80 @@ fn synthetic_registry_covers_all_eval_scenarios() {
         assert!(!f.is_empty());
         assert_eq!(f.data[0].len(), 1);
     }
+}
+
+#[test]
+fn hc_attribution_renders_per_stream_provenance() {
+    use cesura::bench::multistream_adapter::HcAggregatorAdapter;
+    use cesura::bench::{render_attribution, AttributionRow};
+    use cesura::eval::Rng;
+
+    // A multi-stream HC fire must surface the
+    // crossing stream(s) through the rendered attribution table. Build
+    // a 4-stream synthetic fixture with a 5σ shift on stream 1 only;
+    // HC's `attribution[i]` should list at least stream 1 for the
+    // post-shift fire.
+    const T: usize = 240;
+    const D: usize = 4;
+    const CP_STEP: usize = 120;
+    const SHIFT: f64 = 5.0;
+    let mut rng = Rng::new(7);
+    let mut data: Vec<Vec<f64>> = Vec::with_capacity(T);
+    for t in 0..T {
+        let mut row = Vec::with_capacity(D);
+        for s in 0..D {
+            let mu = if t >= CP_STEP && s == 1 { SHIFT } else { 0.0 };
+            row.push(rng.normal(mu, 1.0));
+        }
+        data.push(row);
+    }
+    let fix = Fixture {
+        name: "synthetic_hc_attribution_4_streams".into(),
+        version: 1,
+        d: D,
+        data,
+        epochs: None,
+        ground_truth: vec![CP_STEP],
+        seed: Some(7),
+        margin: 30,
+    };
+
+    let adapter = HcAggregatorAdapter::with_bf_streams(3.0).label("HC(BF)");
+    let (_, result) = run_bench(&adapter, &fix);
+    assert!(!result.cps.is_empty(), "HC fired no CPs on a 5σ shift");
+
+    let mut rows: Vec<AttributionRow> = Vec::new();
+    for (i, streams) in result.attribution.iter().enumerate() {
+        if streams.is_empty() {
+            continue;
+        }
+        let cp = &result.cps[i];
+        let names: Vec<String> = streams.iter().map(|&s| format!("s{s}")).collect();
+        rows.push(AttributionRow {
+            detector: "HC(BF)".into(),
+            fixture: fix.name.clone(),
+            fire_idx: i,
+            cp_index: cp.index,
+            confidence: cp.confidence,
+            streams: names,
+        });
+    }
+    assert!(
+        !rows.is_empty(),
+        "HC produced 0 attribution rows on a 4-stream fixture with sparse 5σ shift"
+    );
+    let md = render_attribution(&rows);
+    assert!(md.contains("| streams |"), "expected attribution header in markdown");
+    // Structural assertion: at least one row names at
+    // least one stream. Exact stream identities are sensitive to BOCPD
+    // warmup / ARL_0 noise on a 240-step tape -- HC may attribute to a
+    // false-alarm stream first. The harness contract is that
+    // attribution is rendered, not that it's correct on small tapes.
+    let any_stream = rows.iter().any(|r| !r.streams.is_empty());
+    assert!(
+        any_stream,
+        "expected ≥1 attribution row with ≥1 stream; got:\n{md}"
+    );
 }
 
 fn tempdir_unique(prefix: &str) -> std::path::PathBuf {

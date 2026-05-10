@@ -20,8 +20,8 @@ pub mod multistream_adapter;
 pub use detector::{CpDetector, DetectionResult};
 pub use fixture::{Fixture, FixtureError, FixtureRegistry, KNOWN_EVENTS};
 pub use harness::{
-    classify_verdict, label_str, load_reports, power_label, render_markdown, run_bench,
-    write_report, Report, Verdict, VerdictLabel, DEFAULT_MIN_EVENTS,
+    classify_verdict, label_str, load_reports, power_label, render_attribution, render_markdown,
+    run_bench, write_report, AttributionRow, Report, Verdict, VerdictLabel, DEFAULT_MIN_EVENTS,
 };
 pub use metrics::{
     count_event_hits, count_far_cps, evaluate, f1_with_margin, per_event_hits, Metrics,
