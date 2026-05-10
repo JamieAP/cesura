@@ -329,6 +329,139 @@ fn run_bench_via_conformal_adapter_projects_to_changepoint() {
 }
 
 #[test]
+fn anomaly_injected_crypto_includes_known_events() {
+    use cesura::bench::KNOWN_EVENTS;
+    let fix = match FixtureRegistry::anomaly_injected_crypto(7, 200, 3.0) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("crypto parquet unavailable: {e} -- skipping J7-2 assertion");
+            return;
+        }
+    };
+    let native = match FixtureRegistry::crypto_macro_5() {
+        Ok(f) => f,
+        Err(_) => return,
+    };
+    // The injected fixture's ground_truth = native ∪ injections, deduped.
+    // Lower bound: max(n_native, n_inj). Upper bound: n_native + n_inj.
+    let n_native = native.ground_truth.len();
+    assert_eq!(
+        n_native,
+        KNOWN_EVENTS
+            .iter()
+            .filter(|(_, date)| {
+                use cesura::bench::loaders::parse_iso_date;
+                let parquet_max = native.epochs.as_ref().unwrap().last().copied().unwrap_or(0);
+                parse_iso_date(date) <= parquet_max
+            })
+            .count()
+    );
+    assert!(
+        fix.ground_truth.len() >= n_native,
+        "injected fixture must include native KNOWN_EVENTS: \
+         injected has {} events, native crypto_macro_5 has {}",
+        fix.ground_truth.len(),
+        n_native
+    );
+    assert!(
+        fix.ground_truth.len() >= 200,
+        "injected fixture missing the synthetic CPs: only {} events",
+        fix.ground_truth.len()
+    );
+    // Every native CP index must appear in the injected fixture's
+    // ground truth.
+    for &nat_idx in &native.ground_truth {
+        assert!(
+            fix.ground_truth.contains(&nat_idx),
+            "native index {nat_idx} missing from injected fixture's ground_truth"
+        );
+    }
+}
+
+#[test]
+fn anomaly_injected_indices_includes_macro_events() {
+    let fix = match FixtureRegistry::anomaly_injected_indices(&[], 7, 60, 3.0) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("indices parquet unavailable: {e} -- skipping J7-2 assertion");
+            return;
+        }
+    };
+    let native = match FixtureRegistry::indices_macro_v1(&[]) {
+        Ok(f) => f,
+        Err(_) => return,
+    };
+    let n_native = native.ground_truth.len();
+    assert!(
+        fix.ground_truth.len() >= n_native,
+        "injected fixture must include native INDICES_MACRO_EVENTS: \
+         injected has {} events, native indices_macro_v1 has {}",
+        fix.ground_truth.len(),
+        n_native
+    );
+    assert!(
+        fix.ground_truth.len() >= 60,
+        "injected fixture missing the synthetic CPs: only {} events",
+        fix.ground_truth.len()
+    );
+    for &nat_idx in &native.ground_truth {
+        assert!(
+            fix.ground_truth.contains(&nat_idx),
+            "native index {nat_idx} missing from injected fixture's ground_truth"
+        );
+    }
+}
+
+#[test]
+fn bench_audit_trail_emits_canonical_block() {
+    use cesura::bench::adapters::BocpdAdapter;
+    use cesura::bench::BenchAuditTrail;
+
+    // Single-fixture / two-detector minimal case. Asserts the canonical
+    // block shape (intro + classify_verdict banner + render_markdown
+    // table), verifying the unified API contract.
+    let fix = FixtureRegistry::synthetic()
+        .into_iter()
+        .find(|f| f.name == "noisy_3sigma")
+        .expect("3sigma scenario");
+    let det_a = BocpdDetector::new(200.0, 250);
+    let det_b = BocpdDetector::new(400.0, 250);
+    let adapter_a = BocpdAdapter { det: &det_a, mv: false, label: "A" };
+    let adapter_b = BocpdAdapter { det: &det_b, mv: false, label: "B" };
+
+    let dir = tempdir_unique("bench_audit_trail");
+    let intro = "Test intro line.";
+    let mut audit = BenchAuditTrail::new(&dir, intro);
+    let m_a = audit.run(&adapter_a, &fix);
+    let m_b = audit.run(&adapter_b, &fix);
+    assert_eq!(audit.reports().len(), 2);
+    // run() returns Metrics; sanity-check shape.
+    assert_eq!(m_a.n_events, fix.ground_truth.len());
+    assert_eq!(m_b.n_events, fix.ground_truth.len());
+
+    let mut out = String::new();
+    audit.render(&mut out);
+    assert!(out.contains("Test intro line."), "missing intro: {out}");
+    assert!(
+        out.contains("**classify_verdict**"),
+        "missing classify_verdict banner"
+    );
+    assert!(
+        out.contains("| detector | fixture |"),
+        "missing render_markdown header"
+    );
+    assert!(out.contains("| A | "), "missing detector A row");
+    assert!(out.contains("| B | "), "missing detector B row");
+    // No HC rows → attribution sub-table omitted.
+    assert!(
+        !out.contains("HC per-stream attribution"),
+        "attribution rendered for non-HC cells"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn indices_macro_v1_has_above_floor_events() {
     use cesura::bench::DEFAULT_MIN_EVENTS;
     let fix = match FixtureRegistry::indices_macro_v1(&[]) {
@@ -444,6 +577,68 @@ fn hc_attribution_renders_per_stream_provenance() {
         any_stream,
         "expected ≥1 attribution row with ≥1 stream; got:\n{md}"
     );
+}
+
+#[test]
+fn hc_attribution_resolves_named_streams_on_indices() {
+    // The unified evaluation API renders HC attribution
+    // with non-numeric stream names on the indices fixture, mirroring the
+    // BTC/ETH/SOL behaviour on crypto. Asserts the asset-name resolver
+    // path for indices_macro_v1.
+    use cesura::bench::adapters::BocpdAdapter;
+    use cesura::bench::multistream_adapter::HcAggregatorAdapter;
+    use cesura::bench::BenchAuditTrail;
+
+    let fix = match FixtureRegistry::indices_macro_v1(&[]) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("indices parquet unavailable: {e} -- skipping J7-4 assertion");
+            return;
+        }
+    };
+    let resolver = |fixture: &str, stream: usize| -> String {
+        if fixture.starts_with("indices_macro_v1") {
+            return match stream {
+                0 => "SPX".to_string(),
+                1 => "NDX".to_string(),
+                2 => "DJI".to_string(),
+                3 => "VIX".to_string(),
+                n => format!("s{n}"),
+            };
+        }
+        format!("s{stream}")
+    };
+    let dir = tempdir_unique("hc_attr_indices");
+    let intro = "Indices HC attribution check.";
+    let mut audit = BenchAuditTrail::new(&dir, intro).with_asset_resolver(resolver);
+
+    // HC adapter for the indices d=4 panel + a univariate Bocpd for
+    // contrast (zero attribution rows).
+    let det = BocpdDetector::new(720.0, 256);
+    let bocpd_adapter = BocpdAdapter { det: &det, mv: true, label: "Bocpd-mv" };
+    let hc_adapter = HcAggregatorAdapter::with_bf_streams(3.0).label("HC(BF)");
+    audit.run(&hc_adapter, &fix);
+    audit.run(&bocpd_adapter, &fix);
+
+    let mut out = String::new();
+    audit.render(&mut out);
+    // The indices tape may produce zero HC fires under default τ=3.0;
+    // when that happens the attribution sub-table is omitted (correct
+    // behaviour). Only assert resolved-name rendering when the table is
+    // emitted.
+    if out.contains("HC per-stream attribution") {
+        let has_named = out.contains("SPX")
+            || out.contains("NDX")
+            || out.contains("DJI")
+            || out.contains("VIX");
+        assert!(
+            has_named,
+            "expected ≥1 indices stream resolved to its symbol; got:\n{out}"
+        );
+    } else {
+        eprintln!("HC produced 0 attribution rows on indices_macro_v1 -- assertion skipped");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 fn tempdir_unique(prefix: &str) -> std::path::PathBuf {

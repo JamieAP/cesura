@@ -240,13 +240,18 @@ impl FixtureRegistry {
 
         let data = step_shift_inject(&base.data, &chosen, sigma, &sigmas);
 
+        let mut ground_truth: Vec<usize> = base.ground_truth.clone();
+        ground_truth.extend(chosen);
+        ground_truth.sort_unstable();
+        ground_truth.dedup();
+
         Ok(Fixture {
             name: format!("anomaly_injected_crypto_v1_seed{seed}"),
             version: 1,
             d,
             data,
             epochs: base.epochs,
-            ground_truth: chosen,
+            ground_truth,
             seed: Some(seed),
             margin: 48,
         })
@@ -368,6 +373,11 @@ impl FixtureRegistry {
 
         let data = step_shift_inject(&base.data, &chosen, sigma, &sigmas);
 
+        let mut ground_truth: Vec<usize> = base.ground_truth.clone();
+        ground_truth.extend(chosen);
+        ground_truth.sort_unstable();
+        ground_truth.dedup();
+
         let symbol_slug = symbols
             .iter()
             .map(|s| s.trim_start_matches("I:"))
@@ -393,7 +403,7 @@ impl FixtureRegistry {
             d,
             data,
             epochs: base.epochs,
-            ground_truth: chosen,
+            ground_truth,
             seed: Some(seed),
             margin: 4,
         })

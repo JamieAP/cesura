@@ -167,6 +167,164 @@ pub fn render_attribution(rows: &[AttributionRow]) -> String {
     s
 }
 
+/// Asset-name resolver: `(fixture_name, stream_index) → display name`.
+type AssetNameFn<'a> = Box<dyn Fn(&str, usize) -> String + 'a>;
+
+///
+/// The builder owns:
+/// - `intro`: the section text emitted ahead of the audit trail block
+/// - `results_dir`: where per-cell JSON dumps land
+/// - `asset_name_for`: closure resolving `(fixture_name, stream_idx)` to
+///   a display name (BTC/ETH/SOL for crypto_macro_5, SPX/NDX/DJI/VIX for
+///   indices_macro_v1, fallback `s{n}`). Per-fixture knowledge stays
+///   at the example layer; the builder threads it through.
+///
+/// `run` records the `Report` AND the live `DetectionResult` so
+/// per-fire attribution (which `Report` aggregates away) is available
+/// at `render` time without re-running detection.
+pub struct BenchAuditTrail<'a> {
+    intro: String,
+    results_dir: &'a std::path::Path,
+    asset_name_for: AssetNameFn<'a>,
+    cells: Vec<(Report, crate::bench::DetectionResult)>,
+    /// Cap on rows rendered in the markdown table. `None` = render all.
+    /// Used by `comprehensive_report` (large detector × scenario panel)
+    /// where 30 rows is enough sample to validate the harness output;
+    /// the rich matrix above the audit trail is the load-bearing read.
+    render_limit: Option<usize>,
+}
+
+impl<'a> BenchAuditTrail<'a> {
+    pub fn new(results_dir: &'a std::path::Path, intro: impl Into<String>) -> Self {
+        Self {
+            intro: intro.into(),
+            results_dir,
+            // Default resolver: numeric stream indices `s{n}`.
+            asset_name_for: Box::new(|_fix, idx| format!("s{idx}")),
+            cells: Vec::new(),
+            render_limit: None,
+        }
+    }
+
+    /// Cap the rendered markdown table at `n` rows. JSON dumps and the
+    /// classify_verdict banner still cover all cells; only the inline
+    /// table is truncated. Used by examples with very large
+    /// detector × fixture panels where 30 rows is enough to validate
+    /// the harness pipeline and the rich matrix above carries the load.
+    pub fn with_render_limit(mut self, n: usize) -> Self {
+        self.render_limit = Some(n);
+        self
+    }
+
+    /// Override the default `s{n}` stream-index resolver. The closure
+    /// receives `(fixture_name, stream_index)` and returns a display
+    /// name. Fixture-specific name maps stay in the example layer.
+    pub fn with_asset_resolver(
+        mut self,
+        f: impl Fn(&str, usize) -> String + 'a,
+    ) -> Self {
+        self.asset_name_for = Box::new(f);
+        self
+    }
+
+    /// Run a single (detector, fixture) cell. The aggregated `Report`
+    /// is dumped to `results_dir/<fixture>/<detector>-<commit>.json`.
+    /// The live `DetectionResult` is retained for attribution rendering.
+    /// Returns the cell's `Metrics` so callers needing per-cell numbers
+    /// (per-seed F1, custom verdict math) don't have to re-look-up the
+    /// last report.
+    pub fn run<D: CpDetector + ?Sized>(&mut self, det: &D, fix: &Fixture) -> Metrics {
+        let (report, result) = run_bench(det, fix);
+        let _ = write_report(&report, self.results_dir);
+        let metrics = report.metrics.clone();
+        self.cells.push((report, result));
+        metrics
+    }
+
+    /// Read-only access to the aggregated reports (drops the live
+    /// detection results). Useful when an example wants to compute
+    /// custom per-detector aggregates on top of the canonical render.
+    pub fn reports(&self) -> Vec<&Report> {
+        self.cells.iter().map(|(r, _)| r).collect()
+    }
+
+    pub fn classify(&self) -> Verdict {
+        let reports: Vec<Report> = self.cells.iter().map(|(r, _)| r.clone()).collect();
+        classify_verdict(&reports, DEFAULT_MIN_EVENTS)
+    }
+
+    /// Emit the canonical audit-trail block:
+    /// 1. `intro` text (caller-provided)
+    /// 2. classify_verdict banner
+    /// 3. `render_markdown(reports)` table
+    /// 4. (when any HC fire has non-empty attribution)
+    ///    `### HC per-stream attribution` + `render_attribution(rows)`
+    pub fn render(&self, out: &mut String) {
+        let reports: Vec<Report> = self.cells.iter().map(|(r, _)| r.clone()).collect();
+        let verdict = classify_verdict(&reports, DEFAULT_MIN_EVENTS);
+        out.push_str(&self.intro);
+        if !self.intro.ends_with("\n\n") {
+            out.push_str("\n\n");
+        }
+        out.push_str(&format!(
+            "**classify_verdict** ({} reports, min_events={DEFAULT_MIN_EVENTS}): \
+             label = **{}**; {}.\n\n",
+            reports.len(),
+            label_str(verdict.label),
+            verdict.reason,
+        ));
+        if let Some(limit) = self.render_limit {
+            out.push_str(&format!(
+                "Canonical Report table (`render_markdown`, first {limit} rows):\n\n"
+            ));
+            let head: Vec<Report> = reports.iter().take(limit).cloned().collect();
+            out.push_str(&render_markdown(&head));
+        } else {
+            out.push_str("Canonical Report table (`render_markdown`):\n\n");
+            out.push_str(&render_markdown(&reports));
+        }
+        out.push('\n');
+
+        // Attribution sub-table: collect non-empty rows from any HC-named
+        // detector. Sum-CUSUM and univariate cells produce zero rows.
+        let mut attribution_rows: Vec<AttributionRow> = Vec::new();
+        for (report, result) in &self.cells {
+            if !report.detector.starts_with("HC") {
+                continue;
+            }
+            for (i, streams) in result.attribution.iter().enumerate() {
+                if streams.is_empty() {
+                    continue;
+                }
+                let cp = &result.cps[i];
+                let names: Vec<String> = streams
+                    .iter()
+                    .map(|&s| (self.asset_name_for)(&report.fixture, s))
+                    .collect();
+                attribution_rows.push(AttributionRow {
+                    detector: report.detector.clone(),
+                    fixture: report.fixture.clone(),
+                    fire_idx: i,
+                    cp_index: cp.index,
+                    confidence: cp.confidence,
+                    streams: names,
+                });
+            }
+        }
+        if !attribution_rows.is_empty() {
+            out.push_str(
+                "\n### HC per-stream attribution\n\n\
+                 Per-fire attribution from the live `DetectionResult`. For \
+                 HC, `attribution[i]` lists the streams whose p-value crossed \
+                 the threshold for fire `i` (sum-CUSUM and univariate \
+                 detectors are empty by contract; filtered to non-empty rows).\n\n",
+            );
+            out.push_str(&render_attribution(&attribution_rows));
+            out.push('\n');
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum VerdictLabel {
     VerdictGrade,
