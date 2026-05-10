@@ -6,6 +6,23 @@ Bayesian Online Change Point Detection in Rust. Implements Adams &
 MacKay (2007) with a Normal-Inverse-Gamma conjugate prior. Pure Rust,
 no `unsafe`, no runtime dependencies beyond `serde`.
 
+## Recommended detector
+
+```rust,no_run
+use cesura::canonical::recommended_detector;
+use cesura::bench::CpDetector;
+# use cesura::bench::Fixture;
+# let fixture: Fixture = unimplemented!();
+
+let detector = recommended_detector();
+let cps = detector.detect(&fixture);
+```
+
+The factory is feature-gated behind `test-utils` (it returns a bench
+adapter). For the underlying primitives without the bench layer, use
+`SumCusumAggregator` from `cesura::multistream` over per-channel
+`BocpdDetector` streams directly.
+
 ## What it does
 
 Given a stream of `f64` observations, BOCPD maintains a posterior over
