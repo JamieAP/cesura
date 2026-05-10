@@ -39,6 +39,7 @@ pub mod focus;
 pub mod nig_ar1;
 pub mod niw;
 pub mod predictive;
+pub mod pro_bocd;
 pub mod streaming;
 #[cfg(feature = "joint-detection")]
 pub mod streaming_chen_wu;
