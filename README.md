@@ -8,7 +8,29 @@ no `unsafe`, no runtime dependencies beyond `serde`.
 
 ## Recommended detector
 
+**Production / library use** -- un-gated, no dev dependencies:
+
 ```rust,no_run
+use cesura::canonical::recommended_streams;
+
+let mut agg = recommended_streams(4);  // d = 4 channels
+let data: Vec<Vec<f64>> = vec![vec![0.0; 4]; 200];
+let fires = agg.step(&data);
+// fires: Vec<MultiStreamChangePoint> with .index, .confidence, .streams
+```
+
+`recommended_streams(d)` returns a configured
+`SumCusumAggregator<StreamingDetector>`. Each per-channel stream is
+`StreamingDetector::new(200.0, 250)` (λ=200, max_rl=250, NIG
+predictive); the aggregator runs sum-CUSUM with threshold τ=0.1
+over per-bar CP-probabilities. Drive `step(&data)` once per batch
+or window; the aggregator maintains state across calls.
+
+**Evaluation / bench harness** -- feature-gated behind `test-utils`,
+slots into the `CpDetector` trait:
+
+```rust,no_run
+# #[cfg(feature = "test-utils")] {
 use cesura::canonical::recommended_detector;
 use cesura::bench::CpDetector;
 # use cesura::bench::Fixture;
@@ -16,12 +38,12 @@ use cesura::bench::CpDetector;
 
 let detector = recommended_detector();
 let cps = detector.detect(&fixture);
+# }
 ```
 
-The factory is feature-gated behind `test-utils` (it returns a bench
-adapter). For the underlying primitives without the bench layer, use
-`SumCusumAggregator` from `cesura::multistream` over per-channel
-`BocpdDetector` streams directly.
+Same canonical configuration; this variant labels the adapter
+`"SumCusum(CpProb, τ=0.1)"` so it appears identifiably in bench
+reports alongside the other adapters.
 
 ## What it does
 
