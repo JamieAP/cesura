@@ -325,7 +325,7 @@ impl FixtureRegistry {
         let n = base.data.len();
         let d = base.d;
         let epochs = base.epochs.as_ref().expect("indices_macro_v1 has epochs");
-        let buffer = 3 * 86_400i64;
+        let buffer = 86_400i64;
 
         let event_epochs: Vec<i64> = INDICES_MACRO_EVENTS
             .iter()
@@ -341,7 +341,7 @@ impl FixtureRegistry {
         }
 
         let mut rng = Rng::new(seed);
-        let min_sep = 24usize;
+        let min_sep = 8usize;
         let mut chosen: Vec<usize> = Vec::with_capacity(n_inj);
         let mut attempts = 0usize;
         let max_attempts = n_inj * 50;
