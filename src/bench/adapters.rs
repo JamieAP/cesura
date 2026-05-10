@@ -23,18 +23,24 @@ use crate::bench::fixture::Fixture;
 use crate::conformal::{ConformalCpWrapper, MvScoredDetect, ScoredDetect};
 use crate::dm_bocd::{DmBocdDetector, MWeight};
 use crate::focus::FocusDetector;
+use crate::nig::Nig;
+use crate::predictive::Predictive;
 use crate::{BocpdDetector, ChangePoint, EnsembleDetector};
 
 #[cfg(feature = "joint-detection")]
 use crate::chen_wu::{ChenWuDetector, Detection};
 
-pub struct BocpdAdapter<'a> {
-    pub det: &'a BocpdDetector,
+/// Bench adapter for `BocpdDetector<P>`. Generic over the predictive
+/// `P` so non-default plugs (e.g., `NigAr1`) can be evaluated without
+/// custom adapter glue. Default `P = Nig` keeps existing call sites
+/// (`BocpdAdapter { det, mv, label }`) compiling unchanged.
+pub struct BocpdAdapter<'a, P: Predictive = Nig> {
+    pub det: &'a BocpdDetector<P>,
     pub mv: bool,
     pub label: &'a str,
 }
 
-impl CpDetector for BocpdAdapter<'_> {
+impl<P: Predictive> CpDetector for BocpdAdapter<'_, P> {
     fn name(&self) -> String {
         self.label.to_string()
     }
@@ -44,6 +50,120 @@ impl CpDetector for BocpdAdapter<'_> {
         } else {
             self.det.detect(&fix.as_univariate())
         }
+    }
+}
+
+/// Per-channel univariate `BocpdDetector::<P>::detect` + OR-union
+/// across channels with margin-aware dedup. Mirrors
+/// [`FocusDetector::detect_multivariate`]'s per-dim pattern. Generic
+/// over the predictive `P`, defaulting to `Nig`. Use this when:
+///
+/// - The fixture is multivariate but events are per-asset specific
+///   (a single channel reacts; joint posterior dilutes the signal).
+/// - You want to exercise a univariate predictive (`NigAr1`,
+///   custom `Predictive` plug) on multivariate input. The joint
+///   `BocpdDetector::detect_multivariate` ignores the `P` type
+///   parameter and always uses NIW (per its doc-comment), so this
+///   adapter is the only correctness-preserving way to test a
+///   non-NIW likelihood multivariately today.
+///
+/// `prior_factory` builds a fresh `P` per channel (each channel has
+/// its own warmup / sufficient stats). For default `Nig` use
+/// `Default::default`. For `NigAr1` use `NigAr1::default_prior` etc.
+///
+/// `dedup_window` collapses union output entries within `window` bars
+/// of the previous emitted CP. Default `0` = no dedup. Setting to the
+/// fixture's `margin` keeps the union compact without losing distinct
+/// nearby events (since `match_detections` does bipartite GT-event
+/// matching, multi-fires don't stack into TPs anyway).
+pub struct BocpdPerChannelAdapter<'a, P: Predictive = Nig> {
+    pub label: &'a str,
+    pub lambda: f64,
+    pub max_rl: usize,
+    pub prior_factory: Box<dyn Fn() -> P + 'a>,
+    pub dedup_window: usize,
+}
+
+impl<'a> BocpdPerChannelAdapter<'a, Nig> {
+    /// Constructor for the default `Nig` predictive. Each channel
+    /// gets a fresh `BocpdDetector::new(lambda, max_rl)`-equivalent
+    /// (NIG prior `(μ=0, κ=1, α=1, β=1)`).
+    pub fn new(label: &'a str, lambda: f64, max_rl: usize) -> Self {
+        Self {
+            label,
+            lambda,
+            max_rl,
+            prior_factory: Box::new(|| Nig::new(0.0, 1.0, 1.0, 1.0)),
+            dedup_window: 0,
+        }
+    }
+}
+
+impl<'a, P: Predictive + 'a> BocpdPerChannelAdapter<'a, P> {
+    /// Constructor for a non-default predictive `P`. `prior_factory`
+    /// is called once per channel to get a fresh `P`.
+    pub fn new_with_prior(
+        label: &'a str,
+        lambda: f64,
+        max_rl: usize,
+        prior_factory: impl Fn() -> P + 'a,
+    ) -> Self {
+        Self {
+            label,
+            lambda,
+            max_rl,
+            prior_factory: Box::new(prior_factory),
+            dedup_window: 0,
+        }
+    }
+
+    /// Builder: install a `prior_factory` closure that produces a
+    /// fresh `P` per channel. Use this for non-default predictives.
+    pub fn with_prior_factory(mut self, f: impl Fn() -> P + 'a) -> Self {
+        self.prior_factory = Box::new(f);
+        self
+    }
+
+    /// Builder: set the union dedup window. `0` keeps every fire.
+    pub fn with_dedup_window(mut self, window: usize) -> Self {
+        self.dedup_window = window;
+        self
+    }
+}
+
+impl<P: Predictive> CpDetector for BocpdPerChannelAdapter<'_, P> {
+    fn name(&self) -> String {
+        self.label.to_string()
+    }
+    fn detect(&self, fix: &Fixture) -> Vec<ChangePoint> {
+        let n = fix.data.len();
+        let d = fix.d;
+        if n == 0 || d == 0 {
+            return Vec::new();
+        }
+        let mut all: Vec<ChangePoint> = Vec::new();
+        for k in 0..d {
+            let series: Vec<f64> = fix.data.iter().map(|row| row[k]).collect();
+            let det =
+                BocpdDetector::with_prior(self.lambda, self.max_rl, (self.prior_factory)());
+            for cp in det.detect(&series) {
+                all.push(cp);
+            }
+        }
+        all.sort_by_key(|c| c.index);
+        if self.dedup_window == 0 {
+            return all;
+        }
+        let mut out: Vec<ChangePoint> = Vec::with_capacity(all.len());
+        for cp in all {
+            if let Some(last) = out.last() {
+                if cp.index <= last.index + self.dedup_window {
+                    continue;
+                }
+            }
+            out.push(cp);
+        }
+        out
     }
 }
 

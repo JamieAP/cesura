@@ -641,6 +641,134 @@ fn hc_attribution_resolves_named_streams_on_indices() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+// ── BocpdPerChannelAdapter ─────────────────────
+
+/// The per-channel adapter must:
+/// 1. Run univariate `BocpdDetector::detect` on each channel.
+/// 2. OR-union the resulting CPs across channels.
+/// 3. Apply margin-aware dedup (no dedup when window=0; collapse when set).
+/// 4. Return CPs in ascending-index order.
+#[test]
+fn per_channel_adapter_unions_and_dedups() {
+    use cesura::bench::adapters::BocpdPerChannelAdapter;
+    use cesura::bench::CpDetector;
+    use cesura::eval::Rng;
+
+    // 2-channel synthetic. Channel 0: shift at index 100. Channel 1:
+    // shift at index 220. Joint NIW would dilute both as 1-of-2
+    // signals; per-channel detects each in its own stream.
+    let mut rng = Rng::new(0xCAFE);
+    let n = 400usize;
+    let mut data: Vec<Vec<f64>> = Vec::with_capacity(n);
+    for t in 0..n {
+        let c0 = if t < 100 {
+            rng.normal(0.0, 1.0)
+        } else {
+            rng.normal(5.0, 1.0)
+        };
+        let c1 = if t < 220 {
+            rng.normal(0.0, 1.0)
+        } else {
+            rng.normal(5.0, 1.0)
+        };
+        data.push(vec![c0, c1]);
+    }
+    let fix = Fixture {
+        name: "two_channel_disjoint_cps".into(),
+        version: 1,
+        d: 2,
+        data,
+        epochs: None,
+        ground_truth: vec![100, 220],
+        seed: None,
+        margin: 30,
+    };
+
+    // Window=0: every per-channel fire kept (sorted ascending).
+    let adapter_no_dedup =
+        BocpdPerChannelAdapter::new("nig-pc-no-dedup", 200.0, 250).with_dedup_window(0);
+    let cps_no_dedup = adapter_no_dedup.detect(&fix);
+    assert!(
+        !cps_no_dedup.is_empty(),
+        "per-channel union produced 0 CPs on a 5σ-shift fixture"
+    );
+    for w in cps_no_dedup.windows(2) {
+        assert!(
+            w[0].index <= w[1].index,
+            "per-channel union output not sorted"
+        );
+    }
+
+    // Both ground-truth events should be hit (each channel fires in its
+    // own segment).
+    let any_near_100 = cps_no_dedup
+        .iter()
+        .any(|c| (c.index as i64 - 100).abs() <= 30);
+    let any_near_220 = cps_no_dedup
+        .iter()
+        .any(|c| (c.index as i64 - 220).abs() <= 30);
+    assert!(any_near_100, "no CP within ±30 of GT[0]=100; got {cps_no_dedup:?}");
+    assert!(any_near_220, "no CP within ±30 of GT[1]=220; got {cps_no_dedup:?}");
+
+    // Dedup window=30 should not collapse the two GT events (their CPs
+    // are 120 bars apart) but does collapse adjacent fires inside the
+    // same regime.
+    let adapter_dedup =
+        BocpdPerChannelAdapter::new("nig-pc-dedup30", 200.0, 250).with_dedup_window(30);
+    let cps_dedup = adapter_dedup.detect(&fix);
+    assert!(cps_dedup.len() <= cps_no_dedup.len(), "dedup grew CP count");
+    let any_near_100 = cps_dedup
+        .iter()
+        .any(|c| (c.index as i64 - 100).abs() <= 30);
+    let any_near_220 = cps_dedup
+        .iter()
+        .any(|c| (c.index as i64 - 220).abs() <= 30);
+    assert!(
+        any_near_100 && any_near_220,
+        "dedup window=30 collapsed distinct GT events"
+    );
+}
+
+#[test]
+fn per_channel_adapter_with_nig_ar1_prior_runs() {
+    use cesura::bench::adapters::BocpdPerChannelAdapter;
+    use cesura::bench::CpDetector;
+    use cesura::eval::Rng;
+    use cesura::NigAr1;
+
+    let mut rng = Rng::new(0xBEEF);
+    let n = 300usize;
+    let data: Vec<Vec<f64>> = (0..n)
+        .map(|t| {
+            let s = if t < 150 { 0.0 } else { 5.0 };
+            vec![rng.normal(s, 1.0)]
+        })
+        .collect();
+    let fix = Fixture {
+        name: "ar1-prior-smoke".into(),
+        version: 1,
+        d: 1,
+        data,
+        epochs: None,
+        ground_truth: vec![150],
+        seed: None,
+        margin: 30,
+    };
+
+    // The NigAr1 prior path needs the type parameter explicit because
+    // the `new` constructor pins `Nig`.
+    let adapter = BocpdPerChannelAdapter::<NigAr1>::new_with_prior(
+        "ar1-pc-smoke",
+        200.0,
+        250,
+        NigAr1::default_prior,
+    );
+    let cps = adapter.detect(&fix);
+    // Smoke: doesn't panic; produces ≥1 CP near the shift.
+    let near_shift = cps.iter().any(|c| (c.index as i64 - 150).abs() <= 30);
+    assert!(near_shift, "AR(1) per-channel got no CP near GT=150; cps={cps:?}");
+}
+
 fn tempdir_unique(prefix: &str) -> std::path::PathBuf {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
