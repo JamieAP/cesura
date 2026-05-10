@@ -1,23 +1,26 @@
 //! Hand-curated dated macro events for the indices_macro_v1 fixture.
 //!
-//! Format: `(category, label, "YYYY-MM-DD")`. Category is one of
-//! `"FOMC" | "CPI" | "NFP" | "ECB" | "BOJ"`; label is human-readable.
 //!
-//! Sources (record on every revision):
+//! Sources for calendar events (record on every revision):
 //! - FOMC: <https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm>
 //! - CPI: <https://www.bls.gov/schedule/news_release/cpi.htm>
 //! - NFP (Employment Situation): <https://www.bls.gov/schedule/news_release/empsit.htm>
 //! - ECB: <https://www.ecb.europa.eu/press/calendars/mgcgc/html/index.en.html>
 //! - BOJ: <https://www.boj.or.jp/en/mopo/mpmsche_minu/index.htm>
 //!
+//! Non-calendar events (TARIFF / AI / GEO) are hand-curated and subject
+//! to correction; verify their dates before interpreting fixture results.
+//! When a date is corrected, bump `INDICES_MACRO_EVENTS_VERSION` (this
+//! invalidates any cached fixture-derived ground truth on disk).
+//!
 //! Window covered: 2025-01 → 2026-02 (matches `indices_1m/` parquet
-//! shard range). Bump `INDICES_MACRO_EVENTS_VERSION` on any correction.
+//! shard range).
 //!
 //! Verdict floor: count must be ≥ 50 (the `DEFAULT_MIN_EVENTS` knob in
 //! `harness::classify_verdict`). Asserted by
 //! `tests/bench.rs::indices_macro_v1_has_above_floor_events`.
 
-pub const INDICES_MACRO_EVENTS_VERSION: u32 = 1;
+pub const INDICES_MACRO_EVENTS_VERSION: u32 = 2;
 
 /// `(category, label, "YYYY-MM-DD")`. Sorted ascending by date.
 #[allow(clippy::type_complexity)]
@@ -103,6 +106,21 @@ pub const INDICES_MACRO_EVENTS: &[(&str, &str, &str)] = &[
     ("PCE",  "Oct 2025 PCE release",        "2025-11-26"),
     ("PCE",  "Nov 2025 PCE release",        "2025-12-19"),
     ("PCE",  "Dec 2025 PCE release",        "2026-01-30"),
+    ("TARIFF", "Tariffs announced on MX/CA/CN", "2025-02-01"),
+    ("TARIFF", "Liberation Day reciprocal tariffs",  "2025-04-02"),
+    ("TARIFF", "90-day tariff pause + 145% China",   "2025-04-09"),
+    ("TARIFF", "US-China Geneva de-escalation",      "2025-05-12"),
+    ("TARIFF", "Reciprocal tariffs effective (post-pause)", "2025-08-07"),
+    // AI-driven moves. NVDA earnings + DeepSeek aftermath.
+    ("AI", "DeepSeek R1 fallout / NVDA -17%",   "2025-01-27"),
+    ("AI", "NVDA Q4 FY25 earnings",             "2025-02-26"),
+    ("AI", "NVDA Q1 FY26 earnings",             "2025-05-28"),
+    ("AI", "NVDA Q2 FY26 earnings",             "2025-08-27"),
+    ("AI", "NVDA Q3 FY26 earnings",             "2025-11-19"),
+    // Geopolitical. Iran-Israel direct exchange June 2025.
+    ("GEO", "Israel strikes Iran (Rising Lion)", "2025-06-13"),
+    ("GEO", "US strikes Iranian nuclear sites",  "2025-06-22"),
+    ("GEO", "Iran-Israel ceasefire",             "2025-06-24"),
 ];
 
 /// Number of events. Compile-time assertion ensures verdict-floor
