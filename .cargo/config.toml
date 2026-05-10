@@ -1,0 +1,11 @@
+# Cap the cargo job-server at 4 concurrent rustc invocations.
+#
+# Polars (under `feature = "test-utils"`) puts ~50 deps in the build
+# enough parallel rustc workers that they deadlock on memory pressure
+# before any of them finish. The fleet idles at 1% CPU per worker
+# while the link step waits for the job-server semaphore.
+#
+# polars compile + the rest of the bench tests, low enough that no
+# worker stalls. Override with `CARGO_BUILD_JOBS=N` if you want more.
+[build]
+jobs = 4
