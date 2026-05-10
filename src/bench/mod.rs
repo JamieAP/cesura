@@ -11,6 +11,7 @@
 
 pub mod adapters;
 pub mod detector;
+pub mod events;
 pub mod fixture;
 pub mod harness;
 pub mod loaders;
@@ -18,6 +19,7 @@ pub mod metrics;
 pub mod multistream_adapter;
 
 pub use detector::{CpDetector, DetectionResult};
+pub use events::{INDICES_MACRO_EVENTS, INDICES_MACRO_EVENTS_VERSION, INDICES_MACRO_EVENT_COUNT};
 pub use fixture::{Fixture, FixtureError, FixtureRegistry, KNOWN_EVENTS};
 pub use harness::{
     classify_verdict, label_str, load_reports, power_label, render_attribution, render_markdown,

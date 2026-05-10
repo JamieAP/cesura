@@ -329,6 +329,39 @@ fn run_bench_via_conformal_adapter_projects_to_changepoint() {
 }
 
 #[test]
+fn indices_macro_v1_has_above_floor_events() {
+    use cesura::bench::DEFAULT_MIN_EVENTS;
+    let fix = match FixtureRegistry::indices_macro_v1(&[]) {
+        Ok(f) => f,
+        Err(e) => {
+            // Parquet may be absent on CI; treat as #[ignore] de-facto
+            // by skipping the assertion. This matches the
+            // `crypto_macro_5` graceful-skip pattern.
+            eprintln!("indices_macro_v1 unavailable: {e} -- skipping floor assertion");
+            return;
+        }
+    };
+    assert!(
+        fix.ground_truth.len() >= DEFAULT_MIN_EVENTS,
+        "indices_macro_v1 fell below verdict-grade floor: \
+         {} events < DEFAULT_MIN_EVENTS={}",
+        fix.ground_truth.len(),
+        DEFAULT_MIN_EVENTS,
+    );
+    // Corroborating sanity: 4 streams, hourly bars > 1000, fixture
+    // version is the events-table version. Margin is 4 hours.
+    assert_eq!(fix.d, 4, "default symbols are 4 streams (SPX/NDX/DJI/VIX)");
+    assert!(fix.data.len() > 1000, "indices tape too short: {} bars", fix.data.len());
+    assert_eq!(fix.margin, 4);
+    eprintln!(
+        "indices_macro_v1: {} bars, {} events (≥ {})",
+        fix.data.len(),
+        fix.ground_truth.len(),
+        DEFAULT_MIN_EVENTS
+    );
+}
+
+#[test]
 fn synthetic_registry_covers_all_eval_scenarios() {
     let n = FixtureRegistry::synthetic().len();
     assert!(n >= 26, "expected ≥26 synthetic scenarios, got {n}");

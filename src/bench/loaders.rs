@@ -18,6 +18,16 @@ pub const BTC_PARQUET: &str = "data/crypto_macro_1m.parquet";
 pub const TMP_DIR: &str = "/tmp";
 pub const ASSETS: &[&str] = &["btc", "eth", "sol"];
 
+/// Directory of per-day parquets for US equity / vol indices. Schema:
+/// `timestamp:int64 (ms), symbol:str, open/high/low/close:float64`.
+/// Filtered + hour-bucketed by [`load_indices_1m`].
+pub const INDICES_PARQUET_DIR: &str =
+    "data/indices_1m";
+
+/// Default symbols for [`load_indices_1m`] / [`crate::bench::FixtureRegistry::indices_macro_v1`].
+/// 4 streams: SPX (large-cap), NDX (tech), DJI (industrials), VIX (vol).
+pub const INDICES_DEFAULT_SYMBOLS: &[&str] = &["I:SPX", "I:NDX", "I:DJI", "I:VIX"];
+
 /// Per-asset tape: `(name, epochs, log-returns)`.
 pub type AssetSeries = (String, Vec<i64>, Vec<f64>);
 
@@ -160,6 +170,122 @@ pub fn align_assets(per_asset: &[AssetSeries], _d: usize) -> (Vec<i64>, Vec<Vec<
         }
     }
     (epochs, tape)
+}
+
+/// Load hourly log-returns from the indices_1m parquet shard for each
+/// requested symbol. Aggregates 1m bars to hourly by `last(close)` per
+/// `timestamp // 3_600_000`, then `log().diff()`. Returns one
+/// `AssetSeries` per symbol in input order.
+///
+pub fn load_indices_1m(symbols: &[&str]) -> Result<Vec<AssetSeries>, FixtureError> {
+    use polars::prelude::*;
+    if symbols.is_empty() {
+        return Err(FixtureError::Malformed("no symbols requested".into()));
+    }
+    if !Path::new(INDICES_PARQUET_DIR).exists() {
+        return Err(FixtureError::Missing(format!(
+            "indices parquet dir not found: {INDICES_PARQUET_DIR}"
+        )));
+    }
+    let mut paths: Vec<std::path::PathBuf> = fs::read_dir(INDICES_PARQUET_DIR)
+        .map_err(|e| FixtureError::Io(format!("read_dir {INDICES_PARQUET_DIR}: {e}")))?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|x| x == "parquet"))
+        .collect();
+    paths.sort();
+    if paths.is_empty() {
+        return Err(FixtureError::Missing(format!(
+            "no parquet files in {INDICES_PARQUET_DIR}"
+        )));
+    }
+
+    // Build symbol-IN filter. polars 0.50 doesn't expose `is_in` for
+    // string lits without the `is_in` feature flag, so OR-fold matches.
+    let mut syms_iter = symbols.iter();
+    let first = syms_iter.next().unwrap();
+    let mut filter_expr = col("symbol").eq(lit(*first));
+    for s in syms_iter {
+        filter_expr = filter_expr.or(col("symbol").eq(lit(*s)));
+    }
+
+    // Scan each parquet lazily, concat into a single LazyFrame.
+    let scan_args = ScanArgsParquet::default();
+    let mut lazy_frames: Vec<LazyFrame> = Vec::with_capacity(paths.len());
+    for path in &paths {
+        let pl_path = PlPath::new(&path.to_string_lossy());
+        let lf = LazyFrame::scan_parquet(pl_path, scan_args.clone())
+            .map_err(|e| FixtureError::Io(format!("scan_parquet {path:?}: {e}")))?
+            .filter(filter_expr.clone())
+            .filter(col("close").is_not_null().and(col("close").gt(lit(0.0))))
+            .select([col("timestamp"), col("symbol"), col("close")]);
+        lazy_frames.push(lf);
+    }
+    let combined_lf = polars::prelude::concat(
+        &lazy_frames,
+        UnionArgs {
+            rechunk: false,
+            parallel: true,
+            ..Default::default()
+        },
+    )
+    .map_err(|e| FixtureError::Io(format!("concat: {e}")))?;
+
+    // Hour-bucket → last(close) per (symbol, hour) → log-diff over symbol.
+    let agg_lf = combined_lf
+        .with_column((col("timestamp") / lit(3_600_000i64)).alias("hour"))
+        .sort_by_exprs(
+            [col("symbol"), col("timestamp")],
+            SortMultipleOptions::default(),
+        )
+        .group_by_stable([col("symbol"), col("hour")])
+        .agg([col("close").last().alias("v")])
+        .sort_by_exprs(
+            [col("symbol"), col("hour")],
+            SortMultipleOptions::default(),
+        )
+        .with_columns([(col("hour") * lit(3600i64)).alias("epoch_s")])
+        .with_columns([col("v").log(std::f64::consts::E).diff(lit(1), Default::default()).over([col("symbol")]).alias("y")])
+        .filter(col("y").is_not_null().and(col("y").is_finite()))
+        .select([col("symbol"), col("epoch_s"), col("y")]);
+    let agg = agg_lf
+        .collect()
+        .map_err(|e| FixtureError::Io(format!("aggregate: {e}")))?;
+
+    // Project to per-symbol AssetSeries.
+    let mut out: Vec<AssetSeries> = Vec::with_capacity(symbols.len());
+    for sym in symbols {
+        let mask = agg
+            .column("symbol")
+            .map_err(|e| FixtureError::Io(format!("col(symbol): {e}")))?
+            .as_materialized_series()
+            .equal(*sym)
+            .map_err(|e| FixtureError::Io(format!("equal({sym}): {e}")))?;
+        let f = agg
+            .filter(&mask)
+            .map_err(|e| FixtureError::Io(format!("filter({sym}): {e}")))?;
+        let n = f.height();
+        if n == 0 {
+            return Err(FixtureError::Malformed(format!(
+                "no rows for symbol {sym}"
+            )));
+        }
+        let epochs: Vec<i64> = f
+            .column("epoch_s")
+            .map_err(|e| FixtureError::Io(format!("col(epoch_s): {e}")))?
+            .i64()
+            .map_err(|e| FixtureError::Malformed(format!("epoch_s.i64: {e}")))?
+            .into_no_null_iter()
+            .collect();
+        let ys: Vec<f64> = f
+            .column("y")
+            .map_err(|e| FixtureError::Io(format!("col(y): {e}")))?
+            .f64()
+            .map_err(|e| FixtureError::Malformed(format!("y.f64: {e}")))?
+            .into_no_null_iter()
+            .collect();
+        out.push(((*sym).to_string(), epochs, ys));
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
