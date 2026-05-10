@@ -51,6 +51,7 @@ mod bocpd;
 mod math;
 mod nig;
 
+pub use canonical::recommended_streams;
 pub use dm_bocd::DmBocdDetector;
 pub use bocpd::BocpdDetector;
 pub use conformal::{ConformalCp, ConformalCpWrapper, MvScoredDetect, ScoredDetect};
