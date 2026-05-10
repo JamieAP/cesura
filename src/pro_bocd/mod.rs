@@ -5,12 +5,13 @@
 //!
 //!
 
-pub mod posterior;
+pub mod detect;
 pub mod langevin;
+pub mod posterior;
 
 /// Predictively-Oriented BOCD detector.
 ///
-/// Configuration container; this version does not implement the recursion.
+/// Configuration container for the recursion implemented in the detect module.
 /// Holds run-length, particle-count, Langevin step-size, and noise
 /// hyperparameters.
 pub struct PrOBocpdDetector {
