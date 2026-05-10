@@ -769,6 +769,50 @@ fn per_channel_adapter_with_nig_ar1_prior_runs() {
     assert!(near_shift, "AR(1) per-channel got no CP near GT=150; cps={cps:?}");
 }
 
+#[test]
+fn joint_znorm_adapter_smoke() {
+    use cesura::bench::adapters::BocpdJointZnormAdapter;
+    use cesura::bench::CpDetector;
+    use cesura::eval::Rng;
+
+    let mut rng = Rng::new(0xD0D0);
+    let n = 300usize;
+    let mut data: Vec<Vec<f64>> = Vec::with_capacity(n);
+    for t in 0..n {
+        let s = if t < 150 { 0.0 } else { 5.0 };
+        data.push(vec![rng.normal(s, 1.0), rng.normal(s, 1.0)]);
+    }
+    let fix = Fixture {
+        name: "joint-znorm-smoke".into(),
+        version: 1,
+        d: 2,
+        data,
+        epochs: None,
+        ground_truth: vec![150],
+        seed: None,
+        margin: 30,
+    };
+
+    let det = cesura::BocpdDetector::new(200.0, 250);
+    let adapter = BocpdJointZnormAdapter { det: &det, label: "niw-mv-znorm-smoke" };
+    let cps = adapter.detect(&fix);
+    assert!(
+        !cps.is_empty(),
+        "joint-no-whitening produced 0 CPs on a 5σ-shift fixture"
+    );
+    for w in cps.windows(2) {
+        assert!(
+            w[0].index <= w[1].index,
+            "joint-no-whitening output not sorted"
+        );
+    }
+    let near_shift = cps.iter().any(|c| (c.index as i64 - 150).abs() <= 30);
+    assert!(
+        near_shift,
+        "joint-no-whitening got no CP near GT=150; cps={cps:?}"
+    );
+}
+
 fn tempdir_unique(prefix: &str) -> std::path::PathBuf {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

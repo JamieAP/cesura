@@ -53,6 +53,27 @@ impl<P: Predictive> CpDetector for BocpdAdapter<'_, P> {
     }
 }
 
+/// Joint multivariate `BocpdDetector` bench adapter with the Cholesky
+/// whitening preamble disabled. Wraps
+/// [`BocpdDetector::detect_multivariate_no_whiten`].
+///
+///
+/// Same `P`-agnostic caveat as [`BocpdAdapter`] with `mv: true`: the
+/// underlying recursion is hard-coded NIW regardless of `P`.
+pub struct BocpdJointZnormAdapter<'a, P: Predictive = Nig> {
+    pub det: &'a BocpdDetector<P>,
+    pub label: &'a str,
+}
+
+impl<P: Predictive> CpDetector for BocpdJointZnormAdapter<'_, P> {
+    fn name(&self) -> String {
+        self.label.to_string()
+    }
+    fn detect(&self, fix: &Fixture) -> Vec<ChangePoint> {
+        self.det.detect_multivariate_no_whiten(&fix.data)
+    }
+}
+
 /// Per-channel univariate `BocpdDetector::<P>::detect` + OR-union
 /// across channels with margin-aware dedup. Mirrors
 /// [`FocusDetector::detect_multivariate`]'s per-dim pattern. Generic
