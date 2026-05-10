@@ -74,6 +74,23 @@ impl<P: Predictive> CpDetector for BocpdJointZnormAdapter<'_, P> {
     }
 }
 
+/// Bench adapter for [`crate::pro_bocd::PrOBocpdDetector`].
+///
+pub struct PrOBocpdAdapter<'a> {
+    pub det: &'a crate::pro_bocd::PrOBocpdDetector,
+    pub seed: u64,
+    pub label: &'a str,
+}
+
+impl CpDetector for PrOBocpdAdapter<'_> {
+    fn name(&self) -> String {
+        self.label.to_string()
+    }
+    fn detect(&self, fix: &Fixture) -> Vec<ChangePoint> {
+        self.det.detect_multivariate_seeded(&fix.data, self.seed)
+    }
+}
+
 /// Per-channel univariate `BocpdDetector::<P>::detect` + OR-union
 /// across channels with margin-aware dedup. Mirrors
 /// [`FocusDetector::detect_multivariate`]'s per-dim pattern. Generic

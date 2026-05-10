@@ -822,3 +822,46 @@ fn tempdir_unique(prefix: &str) -> std::path::PathBuf {
     std::fs::create_dir_all(&p).unwrap();
     p
 }
+
+/// Smoke test: PrOBocpdAdapter wraps detect_multivariate_seeded
+/// and produces non-empty CP output on a clean shift fixture, sorted
+/// ascending.
+#[test]
+fn pro_bocd_adapter_smoke() {
+    use cesura::bench::adapters::PrOBocpdAdapter;
+    use cesura::bench::CpDetector;
+    use cesura::eval::Rng;
+    use cesura::pro_bocd::PrOBocpdDetector;
+
+    let mut rng = Rng::new(0xF00BAA);
+    let n = 300usize;
+    let mut data: Vec<Vec<f64>> = Vec::with_capacity(n);
+    for t in 0..n {
+        let s = if t < 150 { 0.0 } else { 5.0 };
+        data.push(vec![rng.normal(s, 1.0), rng.normal(s, 1.0)]);
+    }
+    let fix = Fixture {
+        name: "pro-bocd-smoke".into(),
+        version: 1,
+        d: 2,
+        data,
+        epochs: None,
+        ground_truth: vec![150],
+        seed: None,
+        margin: 30,
+    };
+
+    let det = PrOBocpdDetector::new(200.0, 250).with_n_particles(8);
+    let adapter = PrOBocpdAdapter {
+        det: &det,
+        seed: 0xC0FFEE,
+        label: "pro-bocd-smoke",
+    };
+    let cps = adapter.detect(&fix);
+    assert!(!cps.is_empty(), "PrO-BOCD adapter produced 0 CPs on a 5σ shift");
+    for w in cps.windows(2) {
+        assert!(w[0].index <= w[1].index, "PrO-BOCD adapter output not sorted");
+    }
+    let near_shift = cps.iter().any(|c| (c.index as i64 - 150).abs() <= 30);
+    assert!(near_shift, "no CP within ±30 of GT=150; cps={cps:?}");
+}
