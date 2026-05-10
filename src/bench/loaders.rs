@@ -1,16 +1,9 @@
-//! Parquet/CSV/date helpers shared by the example emitters.
-//! This version uses a fixed parquet path; it has no environment-variable
-//! path override.
-//!
-//! Parquet ingestion shells out to `uv run python` with a small polars
-//! script (no Rust parquet dep). The script writes per-asset hourly
-//! log-return CSVs to `/tmp/cesura-<asset>-logret.csv`; subsequent
-//! runs reuse them via a `Once`-guarded skip.
+//! Local Parquet/CSV and date helpers for optional evaluation fixtures.
+//! This version uses fixed paths under `data/`; datasets are supplied separately.
+//! Parquet ingestion uses native Polars and may create derived CSVs in /tmp.
 
 use std::fs;
 use std::path::Path;
-use std::process::Command;
-use std::sync::Once;
 
 use crate::bench::fixture::FixtureError;
 
@@ -31,10 +24,9 @@ pub const INDICES_DEFAULT_SYMBOLS: &[&str] = &["I:SPX", "I:NDX", "I:DJI", "I:VIX
 /// Per-asset tape: `(name, epochs, log-returns)`.
 pub type AssetSeries = (String, Vec<i64>, Vec<f64>);
 
-static PREPARE_REAL: Once = Once::new();
-
 /// Idempotent prepare: writes `cesura-<asset>-logret.csv` to `TMP_DIR`
-/// if absent. Errors out if the parquet file is not present.
+/// if absent. Errors out if the parquet file is not present. Uses
+/// native polars without a subprocess, matching [`load_indices_1m`].
 pub fn prepare_real_csvs() -> Result<(), FixtureError> {
     if ASSETS
         .iter()
@@ -43,49 +35,55 @@ pub fn prepare_real_csvs() -> Result<(), FixtureError> {
         return Ok(());
     }
     if !Path::new(BTC_PARQUET).exists() {
-        return Err(FixtureError::Missing(format!("parquet not found: {BTC_PARQUET}")));
+        return Err(FixtureError::Missing(format!(
+            "parquet not found: {BTC_PARQUET}"
+        )));
     }
-    let mut err: Option<String> = None;
-    PREPARE_REAL.call_once(|| {
-        let py = format!(
-            r#"
-import polars as pl
-src = pl.scan_parquet("{BTC_PARQUET}").select(["timestamp_ms", "btc_vwap", "eth_vwap", "sol_vwap"])
-def hourly_logret(col):
-    return (
-        src.filter(pl.col(col).is_not_null() & pl.col(col).is_finite() & (pl.col(col) > 0))
-           .with_columns((pl.col("timestamp_ms") // 3600_000).alias("hour"))
-           .group_by("hour", maintain_order=True)
-           .agg(pl.col(col).last().alias("v"))
-           .sort("hour")
-           .with_columns([
-               (pl.col("hour") * 3600).alias("epoch_s"),
-               pl.col("v").log().diff().alias("y"),
-           ])
-           .filter(pl.col("y").is_not_null() & pl.col("y").is_finite())
-           .select(["epoch_s", "y"])
-           .collect()
-    )
-hourly_logret("btc_vwap").write_csv("{TMP_DIR}/cesura-btc-logret.csv", include_header=False)
-hourly_logret("eth_vwap").write_csv("{TMP_DIR}/cesura-eth-logret.csv", include_header=False)
-hourly_logret("sol_vwap").write_csv("{TMP_DIR}/cesura-sol-logret.csv", include_header=False)
-"#
-        );
-        let res = Command::new("uv")
-            .args(["run", "--with", "polars", "--no-project", "python3", "-c", &py])
-            .env("POLARS_MAX_THREADS", "1")
-            .env("RAYON_NUM_THREADS", "1")
-            .output();
-        match res {
-            Err(e) => err = Some(format!("uv spawn: {e}")),
-            Ok(out) if !out.status.success() => {
-                err = Some(format!("polars: {}", String::from_utf8_lossy(&out.stderr)))
-            }
-            Ok(_) => {}
+    use polars::prelude::*;
+
+    let pl_path = PlPath::new(BTC_PARQUET);
+    let scan_args = ScanArgsParquet::default();
+    let scan = LazyFrame::scan_parquet(pl_path, scan_args)
+        .map_err(|e| FixtureError::Io(format!("scan_parquet {BTC_PARQUET}: {e}")))?;
+
+    // Mirror the original Python: per asset, filter + bucket + log-diff + write.
+    for asset in ASSETS {
+        let csv_path = format!("{TMP_DIR}/cesura-{asset}-logret.csv");
+        if Path::new(&csv_path).exists() {
+            continue;
         }
-    });
-    if let Some(e) = err {
-        return Err(FixtureError::Io(e));
+        let col_name = format!("{asset}_vwap");
+        let agg_lf = scan
+            .clone()
+            .select([col("timestamp_ms"), col(col_name.as_str())])
+            .filter(
+                col(col_name.as_str())
+                    .is_not_null()
+                    .and(col(col_name.as_str()).gt(lit(0.0))),
+            )
+            .with_column((col("timestamp_ms") / lit(3_600_000i64)).alias("hour"))
+            .sort_by_exprs([col("timestamp_ms")], SortMultipleOptions::default())
+            .group_by_stable([col("hour")])
+            .agg([col(col_name.as_str()).last().alias("v")])
+            .sort_by_exprs([col("hour")], SortMultipleOptions::default())
+            .with_columns([
+                (col("hour") * lit(3600i64)).alias("epoch_s"),
+                col("v")
+                    .log(std::f64::consts::E)
+                    .diff(lit(1), Default::default())
+                    .alias("y"),
+            ])
+            .filter(col("y").is_not_null().and(col("y").is_finite()))
+            .select([col("epoch_s"), col("y")]);
+        let mut df = agg_lf
+            .collect()
+            .map_err(|e| FixtureError::Io(format!("aggregate {asset}: {e}")))?;
+        let mut writer = std::fs::File::create(&csv_path)
+            .map_err(|e| FixtureError::Io(format!("create {csv_path}: {e}")))?;
+        CsvWriter::new(&mut writer)
+            .include_header(false)
+            .finish(&mut df)
+            .map_err(|e| FixtureError::Io(format!("write_csv {csv_path}: {e}")))?;
     }
     Ok(())
 }

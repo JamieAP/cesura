@@ -73,3 +73,32 @@ fn examples_have_no_dedup_helpers() {
         violations.join("\n  ")
     );
 }
+
+#[test]
+fn no_handtyped_verdict_strings_in_examples() {
+    const FORBIDDEN_PATTERNS: &[&str] = &[
+        "VerdictLabel::VerdictGrade =>",
+        "VerdictLabel::SanityCheck =>",
+        "VerdictLabel::NoiseRange =>",
+    ];
+    let mut files = Vec::new();
+    collect_rs_files(Path::new("examples"), &mut files);
+    let mut violations: Vec<String> = Vec::new();
+    for f in files {
+        let src = match fs::read_to_string(&f) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        for pat in FORBIDDEN_PATTERNS {
+            if src.contains(pat) {
+                violations.push(format!("{}: hand-typed `{}` in match arm", f.display(), pat));
+            }
+        }
+    }
+    assert!(
+        violations.is_empty(),
+        "examples must not pattern-match VerdictLabel to hand-typed \
+         strings -- use `cesura::bench::label_str(verdict.label)`:\n  {}",
+        violations.join("\n  ")
+    );
+}
