@@ -33,6 +33,8 @@ pub mod dm_bocd;
 pub mod ensemble;
 #[cfg(any(test, feature = "test-utils"))]
 pub mod eval;
+#[cfg(feature = "test-utils")]
+pub mod bench;
 pub mod focus;
 pub mod nig_ar1;
 pub mod niw;

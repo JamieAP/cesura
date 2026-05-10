@@ -12,18 +12,20 @@ rust-version = "1.87"
 
 [features]
 default = ["joint-detection", "robust"]
-test-utils = []
+test-utils = ["dep:serde_json"]
 robust = []
 joint-detection = []
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", optional = true }
 
 [dev-dependencies]
 serde_json = "1"
 changepoint = "0.15"
 rv = "0.19"
 criterion = "0.8"
+proptest = "1.4"
 
 [[test]]
 name = "statistical"
@@ -54,6 +56,10 @@ name = "focus"
 required-features = ["test-utils"]
 
 [[test]]
+name = "bench"
+required-features = ["test-utils"]
+
+[[test]]
 name = "chen_wu"
 required-features = ["test-utils", "joint-detection"]
 
@@ -63,6 +69,14 @@ required-features = ["test-utils", "joint-detection"]
 
 [[test]]
 name = "multistream"
+required-features = ["test-utils"]
+
+[[test]]
+name = "dm_bocd_coverage"
+required-features = ["test-utils"]
+
+[[test]]
+name = "dm_bocd_properties"
 required-features = ["test-utils"]
 
 [[bench]]
