@@ -19,7 +19,7 @@ joint-detection = []
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", optional = true }
-polars = { version = "0.50", default-features = false, features = ["parquet", "lazy", "diff", "log"], optional = true }
+polars = { version = "0.50", default-features = false, features = ["parquet", "lazy", "diff", "log", "dtype-decimal", "dtype-datetime", "dtype-date"], optional = true }
 
 [dev-dependencies]
 serde_json = "1"
