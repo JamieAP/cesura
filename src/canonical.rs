@@ -2,16 +2,8 @@
 //!
 //!
 //!
-//! # Two factories
+//! # Factories
 //!
-//! - [`recommended_streams`] returns the underlying
-//!   [`SumCusumAggregator<StreamingDetector>`][crate::multistream::SumCusumAggregator]
-//!   -- un-feature-gated, no dev dependencies. Drive `step(&data)`
-//!   directly. **Use this for production / library consumers.**
-//! - [`recommended_detector`] returns a
-//!   [`SumCusumAggregatorAdapter`][crate::bench::multistream_adapter::SumCusumAggregatorAdapter]
-//!   that slots into the bench harness's `CpDetector` trait. Behind
-//!   `feature = "test-utils"`. **Use this for evaluation.**
 
 use crate::multistream::SumCusumAggregator;
 use crate::streaming::StreamingDetector;
@@ -41,6 +33,32 @@ pub fn recommended_streams(d: usize) -> SumCusumAggregator<StreamingDetector> {
     SumCusumAggregator::new(streams).with_threshold(0.1)
 }
 
+/// Cesura's recommended aggregator for **1s-tick microstructure** streams.
+///
+/// Same architecture as [`recommended_streams`] -- per-channel
+/// [`StreamingDetector`] feeding a [`SumCusumAggregator`] over
+/// `ScoreKind::CpProbability` -- but with parameters tuned for the
+/// 1-second log-return regime where the canonical macro defaults
+/// (τ=0.1, λ=200) saturate the confidence histogram. Builds `d`
+/// streams with λ = 200, max_rl = 250, threshold τ = 0.3.
+///
+///
+///
+///
+///
+/// # Use this when
+///
+/// - Per-second (or sub-second) bars over crypto/equity tick data.
+/// - `FeatureKind::LogReturn` or similar narrow-band per-bar scalar.
+///
+/// For hourly / daily macro bars, prefer [`recommended_streams`].
+#[must_use]
+pub fn recommended_streams_tick(d: usize) -> SumCusumAggregator<StreamingDetector> {
+    let streams: Vec<StreamingDetector> =
+        (0..d).map(|_| StreamingDetector::new(200.0, 250)).collect();
+    SumCusumAggregator::new(streams).with_threshold(0.3)
+}
+
 /// Bench-harness convenience over [`recommended_streams`].
 ///
 /// Returns a [`SumCusumAggregatorAdapter`] labelled
@@ -60,6 +78,28 @@ pub fn recommended_detector() -> crate::bench::multistream_adapter::SumCusumAggr
 mod tests {
     use super::*;
     use crate::eval::Rng;
+
+    #[test]
+    fn recommended_streams_tick_runs_on_synthetic_shift() {
+        let mut rng = Rng::new(0xC0FFEEu64);
+        let n = 300usize;
+        let mut data: Vec<Vec<f64>> = Vec::with_capacity(n);
+        for t in 0..n {
+            let s = if t < 150 { 0.0 } else { 5.0 };
+            data.push(vec![rng.normal(s, 1.0)]);
+        }
+        let mut agg = recommended_streams_tick(1);
+        let fires = agg.step(&data);
+        assert!(
+            !fires.is_empty(),
+            "recommended_streams_tick produced 0 fires on a 5σ-shift fixture"
+        );
+        let near_shift = fires.iter().any(|m| (m.index as i64 - 150).abs() <= 30);
+        assert!(
+            near_shift,
+            "recommended_streams_tick got no fire near GT=150; fires={fires:?}"
+        );
+    }
 
     #[test]
     fn recommended_streams_runs_on_synthetic_shift() {
