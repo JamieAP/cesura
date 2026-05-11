@@ -40,7 +40,9 @@ pub fn recommended_streams(d: usize) -> SumCusumAggregator<StreamingDetector> {
 /// `ScoreKind::CpProbability` -- but with parameters tuned for the
 /// 1-second log-return regime where the canonical macro defaults
 /// (τ=0.1, λ=200) saturate the confidence histogram. Builds `d`
-/// streams with λ = 200, max_rl = 250, threshold τ = 0.3.
+/// streams with λ = 2000, max_rl = 250, threshold τ = 0.3.
+///
+///
 ///
 ///
 ///
@@ -55,7 +57,7 @@ pub fn recommended_streams(d: usize) -> SumCusumAggregator<StreamingDetector> {
 #[must_use]
 pub fn recommended_streams_tick(d: usize) -> SumCusumAggregator<StreamingDetector> {
     let streams: Vec<StreamingDetector> =
-        (0..d).map(|_| StreamingDetector::new(200.0, 250)).collect();
+        (0..d).map(|_| StreamingDetector::new(2000.0, 250)).collect();
     SumCusumAggregator::new(streams).with_threshold(0.3)
 }
 
