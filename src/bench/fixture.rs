@@ -99,9 +99,10 @@ pub fn step_shift_inject(
 // ── Registry ─────────────────────────────────────────────────
 
 use crate::bench::events::INDICES_MACRO_EVENTS;
+use crate::bench::hyperliquid_events::HYPERLIQUID_EVENTS_V1;
 use crate::bench::loaders::{
-    align_assets, load_indices_1m, load_real_csv, parse_iso_date, prepare_real_csvs, AssetSeries,
-    ASSETS, INDICES_DEFAULT_SYMBOLS,
+    align_assets, load_hyperliquid_1s, load_indices_1m, load_real_csv, parse_iso_date,
+    prepare_real_csvs, AssetSeries, ASSETS, HYPERLIQUID_DEFAULT_SYMBOLS, INDICES_DEFAULT_SYMBOLS,
 };
 use crate::eval::{all_scenarios, heavy_tail_scenarios, Rng, Scenario};
 
@@ -317,6 +318,62 @@ impl FixtureRegistry {
             ground_truth: gt,
             seed: None,
             margin: 4,
+        })
+    }
+
+    /// Hyperliquid 1s-tick log-returns across `symbols` (default:
+    /// `HYPERLIQUID_DEFAULT_SYMBOLS` = BTC). Ground truth =
+    /// `HYPERLIQUID_EVENTS_V1` dates projected to bar indices via
+    /// nearest-bar lookup; events outside the available parquet window
+    /// are dropped at clip time.
+    ///
+    /// Tape source: Hydromancer Reservoir 1s candles (parquet), stored
+    /// under [`crate::bench::loaders::HYPERLIQUID_PARQUET_DIR`].
+    /// Forward-filled to a dense 1s grid in the loader so margin maps
+    /// cleanly to wall-clock seconds.
+    ///
+    ///
+    pub fn hyperliquid_1s_v1(symbols: &[&str]) -> Result<Fixture, FixtureError> {
+        let symbols: Vec<&str> = if symbols.is_empty() {
+            HYPERLIQUID_DEFAULT_SYMBOLS.to_vec()
+        } else {
+            symbols.to_vec()
+        };
+        let per_asset = load_hyperliquid_1s(&symbols)?;
+        let d = per_asset.len();
+        let (epochs, tape) = align_assets(&per_asset, d);
+        let n = tape.len();
+        if n == 0 {
+            return Err(FixtureError::Malformed(
+                "empty aligned hyperliquid tape".into(),
+            ));
+        }
+        let parquet_max = *epochs.last().unwrap();
+        let parquet_min = *epochs.first().unwrap();
+        let mut gt: Vec<usize> = Vec::new();
+        for (_cat, _label, date) in HYPERLIQUID_EVENTS_V1 {
+            let target = parse_iso_date(date);
+            if target < parquet_min || target > parquet_max {
+                continue;
+            }
+            let pos = epochs
+                .binary_search(&target)
+                .unwrap_or_else(|i| i.min(n - 1));
+            gt.push(pos);
+        }
+        gt.sort_unstable();
+        gt.dedup();
+
+        let symbol_slug = symbols.join("-").to_lowercase();
+        Ok(Fixture {
+            name: format!("hyperliquid_1s_v1_{symbol_slug}"),
+            version: 1,
+            d,
+            data: tape,
+            epochs: Some(epochs),
+            ground_truth: gt,
+            seed: None,
+            margin: 60,
         })
     }
 

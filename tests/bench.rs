@@ -495,6 +495,40 @@ fn indices_macro_v1_has_above_floor_events() {
 }
 
 #[test]
+fn hyperliquid_1s_v1_has_above_floor_events() {
+    use cesura::bench::{DEFAULT_MIN_EVENTS, HYPERLIQUID_EVENTS_V1_COUNT};
+
+    // (1) Static set asserts: the *catalogue* clears the verdict-grade
+    // floor independent of which data is on disk. This is the same
+    // shape as the compile-time assert in `hyperliquid_events.rs`, but
+    // surfaces in test output for visibility.
+    assert!(
+        HYPERLIQUID_EVENTS_V1_COUNT >= DEFAULT_MIN_EVENTS,
+        "HYPERLIQUID_EVENTS_V1 fell below verdict-grade floor: \
+         {} events < DEFAULT_MIN_EVENTS={}",
+        HYPERLIQUID_EVENTS_V1_COUNT,
+        DEFAULT_MIN_EVENTS,
+    );
+
+    let fix = match FixtureRegistry::hyperliquid_1s_v1(&[]) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("hyperliquid_1s_v1 unavailable: {e} -- skipping schema asserts");
+            return;
+        }
+    };
+    assert_eq!(fix.d, 1, "default symbols are [BTC] (single-stream)");
+    assert!(fix.data.len() > 1000, "hyperliquid tape too short: {} bars", fix.data.len());
+    assert_eq!(fix.margin, 60);
+    eprintln!(
+        "hyperliquid_1s_v1: {} bars, {} events (catalogue: {})",
+        fix.data.len(),
+        fix.ground_truth.len(),
+        HYPERLIQUID_EVENTS_V1_COUNT,
+    );
+}
+
+#[test]
 fn synthetic_registry_covers_all_eval_scenarios() {
     let n = FixtureRegistry::synthetic().len();
     assert!(n >= 26, "expected ≥26 synthetic scenarios, got {n}");

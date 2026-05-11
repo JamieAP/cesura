@@ -21,6 +21,28 @@ pub const INDICES_PARQUET_DIR: &str =
 /// 4 streams: SPX (large-cap), NDX (tech), DJI (industrials), VIX (vol).
 pub const INDICES_DEFAULT_SYMBOLS: &[&str] = &["I:SPX", "I:NDX", "I:DJI", "I:VIX"];
 
+/// Directory of per-day Hydromancer Reservoir parquets for Hyperliquid
+/// 1s OHLCV. Layout: `<dir>/date=YYYY-MM-DD/candles.parquet`. Files are
+/// downloaded ahead-of-time via:
+///
+/// ```bash
+/// aws s3 cp \
+///   s3://hydromancer-reservoir/by_dex/hyperliquid/candles/1s/date=YYYY-MM-DD/candles.parquet \
+///   <dir>/date=YYYY-MM-DD/candles.parquet \
+///   --request-payer requester --region ap-northeast-1
+/// ```
+///
+/// Expected source schema:
+///   `coin: string, dex: string, asset_class: string ∈ {perp, spot},
+///    base_symbol, quote_symbol, timestamp: timestamp[ms,UTC],
+///    open/high/low/close/volume/volume_quote: decimal128(20,10),
+///    trade_count: uint32`.
+pub const HYPERLIQUID_PARQUET_DIR: &str =
+    "data/hyperliquid_1s";
+
+/// Default symbols for [`load_hyperliquid_1s`] / [`crate::bench::FixtureRegistry::hyperliquid_1s_v1`].
+pub const HYPERLIQUID_DEFAULT_SYMBOLS: &[&str] = &["BTC"];
+
 /// Per-asset tape: `(name, epochs, log-returns)`.
 pub type AssetSeries = (String, Vec<i64>, Vec<f64>);
 
@@ -286,6 +308,182 @@ pub fn load_indices_1m(symbols: &[&str]) -> Result<Vec<AssetSeries>, FixtureErro
     Ok(out)
 }
 
+///
+/// Reads every `<dir>/date=YYYY-MM-DD/candles.parquet` it finds,
+/// concatenates, filters `coin == sym AND asset_class == "perp"`,
+/// projects `[timestamp, close]`, sorts by timestamp, forward-fills the
+/// 1s grid, then `log().diff()` to log-returns.
+///
+/// Returns one `AssetSeries` per symbol in input order, where the
+/// `epochs` entries are in **seconds** (matches [`load_indices_1m`]
+/// convention; 1s granularity for sub-hourly tapes is still
+/// representable). Empty-day files are silently skipped.
+pub fn load_hyperliquid_1s(symbols: &[&str]) -> Result<Vec<AssetSeries>, FixtureError> {
+    use polars::prelude::*;
+    if symbols.is_empty() {
+        return Err(FixtureError::Malformed("no symbols requested".into()));
+    }
+    if !Path::new(HYPERLIQUID_PARQUET_DIR).exists() {
+        return Err(FixtureError::Missing(format!(
+            "hyperliquid parquet dir not found: {HYPERLIQUID_PARQUET_DIR}"
+        )));
+    }
+
+    // Discover per-day parquet files. Each `date=YYYY-MM-DD/` dir holds
+    // exactly one `candles.parquet`.
+    let mut paths: Vec<std::path::PathBuf> = Vec::new();
+    for entry in fs::read_dir(HYPERLIQUID_PARQUET_DIR)
+        .map_err(|e| FixtureError::Io(format!("read_dir {HYPERLIQUID_PARQUET_DIR}: {e}")))?
+    {
+        let entry = entry.map_err(|e| FixtureError::Io(format!("read_dir entry: {e}")))?;
+        let p = entry.path();
+        if p.is_dir() {
+            let f = p.join("candles.parquet");
+            if f.exists() {
+                paths.push(f);
+            }
+        }
+    }
+    paths.sort();
+    if paths.is_empty() {
+        return Err(FixtureError::Missing(format!(
+            "no candles.parquet files in {HYPERLIQUID_PARQUET_DIR}"
+        )));
+    }
+
+    // Build a coin-IN filter (OR-fold over symbols).
+    let mut syms_iter = symbols.iter();
+    let first = syms_iter.next().unwrap();
+    let mut coin_filter = col("coin").eq(lit(*first));
+    for s in syms_iter {
+        coin_filter = coin_filter.or(col("coin").eq(lit(*s)));
+    }
+
+    let scan_args = ScanArgsParquet::default();
+    let mut lazy_frames: Vec<LazyFrame> = Vec::with_capacity(paths.len());
+    for path in &paths {
+        let pl_path = PlPath::new(&path.to_string_lossy());
+        let lf = LazyFrame::scan_parquet(pl_path, scan_args.clone())
+            .map_err(|e| FixtureError::Io(format!("scan_parquet {path:?}: {e}")))?
+            .filter(coin_filter.clone())
+            .filter(col("asset_class").eq(lit("perp")))
+            .select([
+                col("coin"),
+                col("timestamp").cast(DataType::Int64).alias("timestamp_ms"),
+                col("close").cast(DataType::Float64).alias("close_f64"),
+            ]);
+        lazy_frames.push(lf);
+    }
+    let combined_lf = polars::prelude::concat(
+        &lazy_frames,
+        UnionArgs {
+            rechunk: false,
+            parallel: true,
+            ..Default::default()
+        },
+    )
+    .map_err(|e| FixtureError::Io(format!("concat: {e}")))?;
+
+    let collected = combined_lf
+        .sort_by_exprs(
+            [col("coin"), col("timestamp_ms")],
+            SortMultipleOptions::default(),
+        )
+        .collect()
+        .map_err(|e| FixtureError::Io(format!("collect: {e}")))?;
+
+    // Per-symbol: extract (ts_ms, close), forward-fill 1s grid,
+    // compute log-returns, convert ms→s epochs.
+    let mut out: Vec<AssetSeries> = Vec::with_capacity(symbols.len());
+    for sym in symbols {
+        let mask = collected
+            .column("coin")
+            .map_err(|e| FixtureError::Io(format!("col(coin): {e}")))?
+            .as_materialized_series()
+            .equal(*sym)
+            .map_err(|e| FixtureError::Io(format!("equal({sym}): {e}")))?;
+        let f = collected
+            .filter(&mask)
+            .map_err(|e| FixtureError::Io(format!("filter({sym}): {e}")))?;
+        let n = f.height();
+        if n == 0 {
+            return Err(FixtureError::Malformed(format!(
+                "no rows for coin {sym}"
+            )));
+        }
+        let ts_ms: Vec<i64> = f
+            .column("timestamp_ms")
+            .map_err(|e| FixtureError::Io(format!("col(timestamp_ms): {e}")))?
+            .i64()
+            .map_err(|e| FixtureError::Malformed(format!("timestamp_ms.i64: {e}")))?
+            .into_no_null_iter()
+            .collect();
+        let closes: Vec<f64> = f
+            .column("close_f64")
+            .map_err(|e| FixtureError::Io(format!("col(close_f64): {e}")))?
+            .f64()
+            .map_err(|e| FixtureError::Malformed(format!("close_f64.f64: {e}")))?
+            .into_no_null_iter()
+            .collect();
+
+        let (dense_epochs_s, dense_closes) = densify_seconds(&ts_ms, &closes);
+        let logrets = log_diff(&dense_closes);
+        // log_diff returns N-1 values; align epochs to the diff window
+        // by dropping the first epoch (matches `load_indices_1m`'s
+        // `is_not_null().and(is_finite())` filter at the end).
+        let aligned_epochs: Vec<i64> = dense_epochs_s.iter().skip(1).copied().collect();
+        out.push(((*sym).to_string(), aligned_epochs, logrets));
+    }
+    Ok(out)
+}
+
+/// Forward-fill a sparse `(ts_ms, close)` sequence to a dense 1s grid.
+/// `ts_ms` must be sorted ascending. Returns `(epoch_s, close)` pairs
+/// at 1s spacing covering `[ts_ms[0]/1000, ts_ms.last()/1000]`.
+pub fn densify_seconds(ts_ms: &[i64], closes: &[f64]) -> (Vec<i64>, Vec<f64>) {
+    if ts_ms.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+    let start_s = ts_ms[0] / 1000;
+    let end_s = ts_ms[ts_ms.len() - 1] / 1000;
+    let n = (end_s - start_s + 1).max(0) as usize;
+    let mut epochs = Vec::with_capacity(n);
+    let mut out = Vec::with_capacity(n);
+    let mut idx = 0usize;
+    let mut last_close = closes[0];
+    for s in start_s..=end_s {
+        // Advance source cursor through all samples landing on or before this second.
+        while idx < ts_ms.len() && ts_ms[idx] / 1000 <= s {
+            last_close = closes[idx];
+            idx += 1;
+        }
+        epochs.push(s);
+        out.push(last_close);
+    }
+    (epochs, out)
+}
+
+/// `ln(x[i]) - ln(x[i-1])` over a slice. Returns `N-1` values. Skips
+/// non-finite results (e.g. log of zero or negative) by replacing with
+/// `0.0`; callers are expected to drop the first epoch.
+pub fn log_diff(closes: &[f64]) -> Vec<f64> {
+    if closes.len() < 2 {
+        return Vec::new();
+    }
+    let mut out = Vec::with_capacity(closes.len() - 1);
+    for w in closes.windows(2) {
+        let a = w[0];
+        let b = w[1];
+        let r = if a > 0.0 && b > 0.0 {
+            b.ln() - a.ln()
+        } else {
+            0.0
+        };
+        out.push(if r.is_finite() { r } else { 0.0 });
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -300,6 +498,59 @@ mod tests {
         // formula; guard against off-by-one.
         assert_eq!(parse_iso_date("2000-03-01"), 951_868_800);
         assert_eq!(parse_iso_date("2000-02-29"), 951_782_400);
+    }
+
+    #[test]
+    fn densify_seconds_forward_fills_gap() {
+        // Sparse: trades at t=1000ms (close=100) and t=4000ms (close=102).
+        // Expected dense: t=1, 2, 3, 4 (epoch_s); close = 100, 100, 100, 102.
+        let ts = [1000i64, 4000];
+        let cl = [100.0f64, 102.0];
+        let (e, c) = densify_seconds(&ts, &cl);
+        assert_eq!(e, vec![1, 2, 3, 4]);
+        assert_eq!(c, vec![100.0, 100.0, 100.0, 102.0]);
+    }
+
+    #[test]
+    fn densify_seconds_collapses_same_second() {
+        // Two trades land within the same UTC second: last close wins.
+        let ts = [1500i64, 1700, 3000];
+        let cl = [100.0f64, 101.0, 105.0];
+        let (e, c) = densify_seconds(&ts, &cl);
+        assert_eq!(e, vec![1, 2, 3]);
+        // Second 1: last trade ≤1000ms is index 1 (price 101).
+        assert_eq!(c[0], 101.0);
+        // Second 2: same forward-fill.
+        assert_eq!(c[1], 101.0);
+        // Second 3: catches index 2.
+        assert_eq!(c[2], 105.0);
+    }
+
+    #[test]
+    fn densify_seconds_empty_input() {
+        let (e, c) = densify_seconds(&[], &[]);
+        assert!(e.is_empty() && c.is_empty());
+    }
+
+    #[test]
+    fn log_diff_basic() {
+        let r = log_diff(&[1.0, std::f64::consts::E, 1.0]);
+        assert_eq!(r.len(), 2);
+        assert!((r[0] - 1.0).abs() < 1e-12);   // ln(e/1) = 1
+        assert!((r[1] - -1.0).abs() < 1e-12);  // ln(1/e) = -1
+    }
+
+    #[test]
+    fn log_diff_zero_returns_zero() {
+        // Zero or negative closes → 0.0 (loader's defensive fallback).
+        let r = log_diff(&[0.0, 1.0, -1.0, 2.0]);
+        assert_eq!(r, vec![0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn log_diff_short_input() {
+        assert!(log_diff(&[]).is_empty());
+        assert!(log_diff(&[100.0]).is_empty());
     }
 
     #[test]

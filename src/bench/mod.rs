@@ -29,6 +29,7 @@ pub mod detector;
 pub mod events;
 pub mod fixture;
 pub mod harness;
+pub mod hyperliquid_events;
 pub mod loaders;
 pub mod metrics;
 pub mod multistream_adapter;
@@ -36,6 +37,9 @@ pub mod multistream_adapter;
 pub use detector::{CpDetector, DetectionResult};
 pub use events::{INDICES_MACRO_EVENTS, INDICES_MACRO_EVENTS_VERSION, INDICES_MACRO_EVENT_COUNT};
 pub use fixture::{Fixture, FixtureError, FixtureRegistry, KNOWN_EVENTS};
+pub use hyperliquid_events::{
+    HYPERLIQUID_EVENTS_V1, HYPERLIQUID_EVENTS_V1_COUNT, HYPERLIQUID_EVENTS_V1_VERSION,
+};
 pub use harness::{
     classify_verdict, label_str, load_reports, power_label, render_attribution, render_markdown,
     run_bench, write_report, AttributionRow, BenchAuditTrail, Report, Verdict, VerdictLabel,
