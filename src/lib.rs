@@ -46,6 +46,10 @@ pub mod streaming;
 #[cfg(feature = "joint-detection")]
 pub mod streaming_chen_wu;
 pub mod multistream;
+pub mod runtime;
+
+#[cfg(feature = "cli")]
+pub mod cli;
 
 mod bocpd;
 mod math;

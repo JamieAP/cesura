@@ -117,10 +117,45 @@ Inputs with `< 20` finite samples return an empty result. NaN / non-
 finite values are skipped; reported indices map back to the original
 input positions.
 
+## Agent surfaces
+
+Beyond the library API, cesura ships a `cesura watch` CLI that turns
+the same detector core into an agent-consumable surface. Every fire
+is one JSONL line on stdout, designed to be piped into the Claude
+Code `Monitor` tool so each fire becomes one notification.
+
+```sh
+# tail an observation source through a multistream aggregator and
+# only surface high-confidence fires
+tail -F obs.jsonl | cesura watch --kind sum-cusum --d 4 --min-confidence 0.7
+```
+
+stdin: one JSON value per line -- `{"x": 1.23}` for univariate
+detectors, `{"x": [1.0, 0.5, -0.3, 2.1]}` for multistream. Optional
+`"t"` field is passed through to the matching stdout fire line.
+
+stdout: one fire per line --
+`{"type":"fire","index":N,"confidence":...,"shift_sigma":...,"streams":[...],"kind":"cp"}`.
+A bad input line produces `{"type":"parse_error","line":N,"msg":"..."}`
+and the stream continues -- a single malformed line never tears down
+a Monitor channel.
+
+Discovery: `cesura info` emits a JSON document describing every
+detector kind, its observation shape, and configurable parameters.
+
+The CLI is gated on the `cli` feature (default on). Library consumers
+who only need the in-process API can opt out via
+`default-features = false`.
+
+A stdio MCP server (`cesura-mcp`) is planned as a follow-up, gated on
+a separate `mcp` feature.
+
 ## Features
 
 - `test-utils` -- exposes the `eval` module (synthetic generators, RNG,
   precision/recall scoring) for downstream test suites.
+- `cli` -- builds the `cesura` binary (watch + info subcommands).
+  Default on; opt out via `default-features = false`.
 - `robust` -- enables `BocpdDetector::with_beta` for β-divergence
   robust BOCPD (Knoblauch et al. 2018, arXiv:1806.02261). Bounds the
   influence of any single observation on the posterior, so heavy-tailed
