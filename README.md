@@ -147,8 +147,44 @@ The CLI is gated on the `cli` feature (default on). Library consumers
 who only need the in-process API can opt out via
 `default-features = false`.
 
-A stdio MCP server (`cesura-mcp`) is planned as a follow-up, gated on
-a separate `mcp` feature.
+### `cesura-mcp` (stdio MCP server)
+
+`cesura-mcp` is the MCP-protocol counterpart to `cesura watch`. It
+exposes the same `Runner` over JSON-RPC 2.0 stdio so MCP-speaking
+clients (Claude Code, Cursor, Windsurf, etc.) can drive cesura
+directly as a tool.
+
+```sh
+cargo build --release --features mcp --bin cesura-mcp
+# In your MCP client config:
+{ "command": "/path/to/target/release/cesura-mcp" }
+```
+
+Five tools:
+
+- `cesura_feed(stream_id, kind?, params?, observations) -> {fires, stream_id}`
+- `cesura_snapshot(stream_id) -> {state}`
+- `cesura_restore(state) -> {stream_id, kind}`
+- `cesura_list_streams() -> {streams}`
+- `cesura_close_stream(stream_id) -> {ok, was_present, stream_id}`
+
+Streams lazy-create on the first `cesura_feed` -- pass `kind` and
+`params` on call #1; subsequent calls only need `stream_id` and
+`observations`. Snapshot/restore round-trip the full detector state
+through MCP as structured JSON (no base64).
+
+Gated on the `mcp` feature; opt out with `default-features = false`
+for a library-only build.
+
+Operational note: streams of `kind = "dm-bocd"` cannot be snapshotted
+(upstream `StreamingDmBocd` has no `save_state` yet). Those streams
+do not survive a server restart.
+
+Operational note: malformed JSON-RPC frames terminate the stdio
+channel cleanly (no panic, clean EOF). `rmcp`'s `transport-io` loop
+treats a serde error as fatal, so a single garbage line ends the
+session. MCP clients doing automated retries should reconnect on
+EOF rather than assume the channel survives a malformed message.
 
 ## Features
 

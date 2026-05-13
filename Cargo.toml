@@ -16,6 +16,7 @@ test-utils = ["dep:polars"]
 robust = []
 joint-detection = []
 cli = ["dep:clap", "dep:anyhow"]
+mcp = ["dep:rmcp", "dep:tokio", "dep:dashmap", "dep:uuid", "dep:tracing", "dep:tracing-subscriber", "dep:schemars"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -23,11 +24,23 @@ serde_json = "1"
 polars = { version = "0.50", default-features = false, features = ["parquet", "lazy", "diff", "log", "dtype-decimal", "dtype-datetime", "dtype-date"], optional = true }
 clap = { version = "4", features = ["derive"], optional = true }
 anyhow = { version = "1", optional = true }
+rmcp = { version = "1.6", features = ["server", "transport-io", "macros"], optional = true }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std", "sync"], optional = true }
+dashmap = { version = "6", optional = true }
+uuid = { version = "1", features = ["v4", "serde"], optional = true }
+tracing = { version = "0.1", optional = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
+schemars = { version = "1", optional = true }
 
 [[bin]]
 name = "cesura"
 path = "src/bin/cesura.rs"
 required-features = ["cli"]
+
+[[bin]]
+name = "cesura-mcp"
+path = "src/bin/cesura_mcp.rs"
+required-features = ["mcp"]
 
 [dev-dependencies]
 changepoint = "0.15"
@@ -91,6 +104,10 @@ required-features = ["test-utils"]
 [[test]]
 name = "cli_watch"
 required-features = ["cli"]
+
+[[test]]
+name = "mcp_smoke"
+required-features = ["mcp", "test-utils"]
 
 [[bench]]
 name = "focus_pruning"

@@ -51,6 +51,9 @@ pub mod runtime;
 #[cfg(feature = "cli")]
 pub mod cli;
 
+#[cfg(feature = "mcp")]
+pub mod mcp;
+
 mod bocpd;
 mod math;
 mod nig;
