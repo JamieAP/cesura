@@ -561,28 +561,12 @@ fn cesura_list_and_close_streams() {
 }
 
 #[test]
-fn malformed_jsonrpc_frame_terminates_cleanly_without_panic() {
-    // Primary-source evidence (rmcp 1.6 stderr trace 2026-05-12):
-    //   ERROR rmcp::transport::async_rw: Error reading from stream:
-    //     serde error key must be a string at line 1 column 2
-    //   INFO  rmcp::service: input stream terminated
-    //   INFO  rmcp::service: serve finished quit_reason=Closed
+fn malformed_frame_replies_parse_error_and_channel_survives() {
     //
-    // rmcp 1.6 `transport-io` does NOT emit a JSON-RPC -32700 reply on
-    // malformed frames -- the transport treats a serde error as fatal
-    // and closes the input stream. A reply-then-recover invariant is
-    // not achievable in v1 without wrapping the transport (out of
-    // scope: "sync v1 hardening").
-    //
-    // What v1 DOES guarantee:
-    //   (a) ∄ panic -- the process exits cleanly, not via an unwound
-    //       stack written to stdout.
-    //   (b) ∄ stdout corruption -- every line written before close
-    //       parses as JSON (every other test in this file relies on
-    //       `Server::request`'s `serde_json::from_str` to enforce that
-    //       implicitly).
-    //   (c) The cause is observable on stderr.
-    //
+    //   (1) malformed line → server replies a JSON-RPC `-32700 Parse
+    //       error` frame with `id: null`.
+    //   (2) channel stays open: a subsequent valid `tools/list`
+    //       request receives a normal response.
     let mut s = Server::spawn();
     handshake(&mut s);
 
@@ -593,19 +577,23 @@ fn malformed_jsonrpc_frame_terminates_cleanly_without_panic() {
         .reader
         .read_line(&mut line)
         .expect("read after malformed frame");
-    assert_eq!(
-        n, 0,
-        "expected clean EOF after malformed frame, got line: {line:?}"
-    );
+    assert!(n > 0, "expected -32700 reply frame, got EOF");
+    let reply: serde_json::Value = serde_json::from_str(&line).expect("reply is JSON");
+    assert_eq!(reply.get("jsonrpc").and_then(|v| v.as_str()), Some("2.0"));
+    assert!(reply.get("id").map_or(false, |v| v.is_null()));
+    let err = reply.get("error").expect("error object");
+    assert_eq!(err.get("code").and_then(|v| v.as_i64()), Some(-32700));
 
-    // Close stdin so the child's input-stream loop exits if it hadn't
-    // already, then reap. rmcp closes its input on serde error, so
-    // wait() should return promptly; if it ever hangs we'd need a
-    // try_wait poll, but the stderr trace above confirms quit_reason=Closed.
-    let status = s.child.wait().expect("child reaped");
+    // Channel survives: send a valid request and read a valid response.
+    let resp = s.request("tools/list", serde_json::json!({}));
+    let tools = resp
+        .get("result")
+        .and_then(|r| r.get("tools"))
+        .and_then(|t| t.as_array())
+        .expect("tools/list result.tools");
     assert!(
-        status.success() || status.code() == Some(0),
-        "server must exit cleanly without panic, got: {status:?}"
+        tools.iter().any(|t| t.get("name").and_then(|n| n.as_str()) == Some("cesura_feed")),
+        "tools/list after recovery must include cesura_feed; got: {tools:?}"
     );
 }
 

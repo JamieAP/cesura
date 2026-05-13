@@ -1,6 +1,6 @@
 //! `cesura-mcp` binary -- stdio MCP server. See `src/mcp/`.
 
-use rmcp::{transport::stdio, ServiceExt};
+use rmcp::ServiceExt;
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -15,7 +15,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
     tracing::info!("cesura-mcp v{} starting on stdio", env!("CARGO_PKG_VERSION"));
 
-    let service = cesura::mcp::CesuraServer::new().serve(stdio()).await?;
+    let service = cesura::mcp::CesuraServer::new()
+        .serve(cesura::mcp::transport::resilient_stdio::<rmcp::RoleServer>())
+        .await?;
     service.waiting().await?;
     Ok(())
 }

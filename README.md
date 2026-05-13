@@ -180,12 +180,6 @@ Operational note: streams of `kind = "dm-bocd"` cannot be snapshotted
 (upstream `StreamingDmBocd` has no `save_state` yet). Those streams
 do not survive a server restart.
 
-Operational note: malformed JSON-RPC frames terminate the stdio
-channel cleanly (no panic, clean EOF). `rmcp`'s `transport-io` loop
-treats a serde error as fatal, so a single garbage line ends the
-session. MCP clients doing automated retries should reconnect on
-EOF rather than assume the channel survives a malformed message.
-
 ## Features
 
 - `test-utils` -- exposes the `eval` module (synthetic generators, RNG,
