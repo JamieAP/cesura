@@ -12,9 +12,11 @@
 //!   when the change is dense (most streams shift together).
 //!
 
+mod filter_tick;
 mod hc;
 mod sum_cusum;
 
+pub use filter_tick::{FilterTickAggregator, FilterTickAggregatorState};
 pub use hc::{HcAggregator, HcAggregatorState};
 pub use sum_cusum::{SumCusumAggregator, SumCusumAggregatorState};
 
@@ -65,6 +67,21 @@ pub struct MultiStreamChangePoint {
     /// Empty for joint detectors (sum-CUSUM) where attribution is
     /// not separable.
     pub streams: Vec<usize>,
+    /// Per-stream change-evidence at the fire instant. Length = d for
+    /// both aggregators.
+    ///
+    /// - **sum-CUSUM**: CUSUM W_i, snapshotted BEFORE the post-fire
+    ///   reset. Higher = more sustained evidence.
+    /// - **HC**: per-stream rank-based p-value at the fire's terminal
+    ///   step. Lower = more evidence. The `streams` field carries the
+    ///   index set that crossed below the HC threshold; this field
+    ///   carries the underlying continuous score.
+    ///
+    /// Reporting-only -- not part of the detector logic. The Mei 2010
+    /// asymptotic design says sum-CUSUM has no per-stream attribution,
+    /// but operationally consumers need to know which stream drove a
+    /// fire.
+    pub per_stream_weights: Vec<f64>,
 }
 
 impl ScoreKind {

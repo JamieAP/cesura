@@ -156,12 +156,13 @@ impl<S: ScoreStream> SumCusumAggregator<S> {
                     index: i,
                     confidence,
                     streams: Vec::new(),
+                    per_stream_weights: self.per_stream_w.clone(),
                 });
                 self.last_emit = Some(i);
                 // Reset per-stream CUSUM after firing -- standard
                 // CUSUM-restart practice; without it the aggregator
                 // stays above threshold and re-fires on every cooldown
-                // expiry.
+                // expiry. Snapshot above happens BEFORE this reset.
                 for w in self.per_stream_w.iter_mut() {
                     *w = 0.0;
                 }

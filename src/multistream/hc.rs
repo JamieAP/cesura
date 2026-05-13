@@ -320,6 +320,7 @@ impl<S: ScoreStream> HcAggregator<S> {
                         index: i,
                         confidence,
                         streams: std::mem::take(&mut self.pending_contributors),
+                        per_stream_weights: pvals.clone(),
                     });
                     self.last_emit = Some(i);
                     self.armed = false;

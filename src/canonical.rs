@@ -5,7 +5,7 @@
 //! # Factories
 //!
 
-use crate::multistream::SumCusumAggregator;
+use crate::multistream::{FilterTickAggregator, SumCusumAggregator};
 use crate::streaming::StreamingDetector;
 
 /// Cesura's canonical recommended aggregator for multivariate streams.
@@ -48,17 +48,62 @@ pub fn recommended_streams(d: usize) -> SumCusumAggregator<StreamingDetector> {
 ///
 ///
 ///
-/// # Use this when
 ///
-/// - Per-second (or sub-second) bars over crypto/equity tick data.
-/// - `FeatureKind::LogReturn` or similar narrow-band per-bar scalar.
 ///
-/// For hourly / daily macro bars, prefer [`recommended_streams`].
 #[must_use]
 pub fn recommended_streams_tick(d: usize) -> SumCusumAggregator<StreamingDetector> {
     let streams: Vec<StreamingDetector> =
         (0..d).map(|_| StreamingDetector::new(2000.0, 250)).collect();
-    SumCusumAggregator::new(streams).with_threshold(0.3)
+    let tau_base = 0.3;
+    let tau = tau_base * (d as f64).sqrt();
+    SumCusumAggregator::new(streams).with_threshold(tau)
+}
+
+/// Cesura's recommended **k-of-d co-move detector** for multi-asset
+/// 1s-tick microstructure data.
+///
+/// Returns a [`FilterTickAggregator`] that fires when `≥ k` of `d`
+/// streams have `|observation| > threshold` in a single step,
+/// subject to a 15-step cooldown after each fire. Unlike
+/// [`recommended_streams_tick`] (which uses per-stream BOCPD inside
+/// a sum-CUSUM aggregator), this is a direct threshold filter on
+/// raw observations -- no Bayesian machinery.
+///
+///
+///
+/// # Use this when
+///
+/// - You want **event-coincidence detection** rather than statistical
+///   change-point detection.
+/// - You have d ≥ 3 asynchronously-updating streams and want to
+///   detect synchronous large moves.
+/// - Operator can supply `k`, `threshold`, and `cooldown` based on
+///   their basket / regime.
+///
+/// # Stationarity caveat
+///
+///
+/// # Caveats
+///
+/// - This is not a change-point detector. It does not estimate
+///   regime probabilities, does not maintain per-stream BOCPD
+///   state, and does not produce confidence channels. Every fire
+///   is `confidence = 1.0` (binary trigger).
+/// - Missing-bar handling: pass `NaN` for streams that lack an
+///   observation at the current step. `NaN` is excluded from the
+///   active-count.
+#[must_use]
+pub fn recommended_filter_tick(d: usize, k: usize, threshold: f64) -> FilterTickAggregator {
+    FilterTickAggregator::new(d, k, threshold)
+}
+
+/// `recommended_streams_tick` with operator-chosen threshold τ.
+///
+#[must_use]
+pub fn recommended_streams_tick_with_threshold(d: usize, tau: f64) -> SumCusumAggregator<StreamingDetector> {
+    let streams: Vec<StreamingDetector> =
+        (0..d).map(|_| StreamingDetector::new(2000.0, 250)).collect();
+    SumCusumAggregator::new(streams).with_threshold(tau)
 }
 
 /// Bench-harness convenience over [`recommended_streams`].
