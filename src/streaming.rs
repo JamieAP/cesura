@@ -37,6 +37,49 @@ pub struct DetectorState {
     /// Forward-compat: pre-0.9 snapshots default to None.
     #[serde(default)]
     pub bf_rule: Option<BfRuleState>,
+    /// Optional pre-detector observation transform. `Identity` (default)
+    /// preserves byte-identical behaviour with snapshots without transform support.
+    /// `Logit` unbounds prices in (0, 1) for use against the NIG/NIW
+    /// Gaussian likelihood; intended for bounded-data callers (Polymarket).
+    /// Forward-compat: snapshots without transform support default to Identity.
+    #[serde(default)]
+    pub transform: PriceTransform,
+}
+
+/// Observation-stream transform applied before BOCPD sees the data.
+///
+/// `Identity` is the default and preserves byte-identical behaviour with
+/// existing callers (crypto trade-tick pipelines). `Logit` is intended
+/// for bounded callers whose prices live in (0, 1); it unbounds the
+/// stream so the NIG/NIW Gaussian likelihood is less misspecified near
+/// the boundaries.
+///
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PriceTransform {
+    /// No transform. Default. Behaviour identical to cesura with no transform.
+    #[default]
+    Identity,
+    /// `y = log(x / (1 - x))`, clamped to a tiny epsilon away from 0 and 1
+    /// so endpoints don't produce ±infinity.
+    Logit,
+}
+
+impl PriceTransform {
+    /// Apply the transform to one observation. `Identity` returns `x`
+    /// verbatim. `Logit` clamps `x` to `[eps, 1-eps]` before the log-odds
+    /// transform.
+    #[inline]
+    pub fn apply(self, x: f64) -> f64 {
+        match self {
+            PriceTransform::Identity => x,
+            PriceTransform::Logit => {
+                const EPS: f64 = 1e-9;
+                let xc = x.clamp(EPS, 1.0 - EPS);
+                (xc / (1.0 - xc)).ln()
+            }
+        }
+    }
 }
 
 /// Bayes-factor decision-rule state. When attached to a [`StreamingDetector`]
@@ -207,6 +250,9 @@ pub struct StreamingDetector {
     pending: Vec<PendingCp>,
     /// Bayes-factor rule state. `None` ⇒ MAP-drop trigger (default).
     bf_rule: Option<BfRuleState>,
+    /// Pre-detector observation transform. `Identity` by default;
+    /// `Logit` for bounded-data callers (Polymarket).
+    transform: PriceTransform,
 }
 
 const SHIFT_WINDOW: usize = 20;
@@ -292,7 +338,18 @@ impl StreamingDetector {
             norm_ring: std::collections::VecDeque::with_capacity(2 * SHIFT_WINDOW),
             pending: Vec::new(),
             bf_rule: None,
+            transform: PriceTransform::Identity,
         }
+    }
+
+    /// Set the pre-detector observation transform.
+    ///
+    /// `Identity` (default) preserves byte-identical behaviour with
+    /// callers without transform support. `Logit` unbounds prices in (0, 1) for use
+    /// against the NIG Gaussian likelihood (Polymarket).
+    pub fn with_transform(mut self, transform: PriceTransform) -> Self {
+        self.transform = transform;
+        self
     }
 
     /// Switch the streaming detector from MAP-drop (default) to the
@@ -413,6 +470,13 @@ impl StreamingDetector {
             let current_raw = self.raw_steps;
             self.raw_steps += 1;
 
+            if !x.is_finite() {
+                continue;
+            }
+            // Pre-detector transform. `Identity` is a no-op pass-through
+            // (byte-identical to untransformed behavior); `Logit` unbounds
+            // x ∈ (0, 1) for the Gaussian likelihood.
+            let x = self.transform.apply(x);
             if !x.is_finite() {
                 continue;
             }
@@ -680,6 +744,7 @@ impl StreamingDetector {
             raw_index_map: self.raw_index_map.clone(),
             beta: self.beta,
             bf_rule: self.bf_rule.clone(),
+            transform: self.transform,
         }
     }
 
@@ -743,6 +808,7 @@ impl StreamingDetector {
             norm_ring: std::collections::VecDeque::with_capacity(2 * SHIFT_WINDOW),
             pending: Vec::new(),
             bf_rule: state.bf_rule,
+            transform: state.transform,
         })
     }
 
@@ -1495,5 +1561,111 @@ mod tests {
         let restored: DetectorState = serde_json::from_value(state_json).unwrap();
         assert!(restored.bf_rule.is_none());
         let _det = StreamingDetector::restore(restored).unwrap();
+    }
+
+    // PriceTransform tests --------------------------------------------
+
+    #[test]
+    fn transform_identity_is_byte_identical_to_default() {
+        // Hard invariant: explicit Identity produces the exact same map_rls
+        // and cp_probs as a detector constructed without with_transform.
+        // This pins byte-identical behavior on the synthetic mean-shift fixture.
+        let data: Vec<f64> = (0..300)
+            .map(|i| if i < 150 { 0.0_f64 } else { 5.0_f64 })
+            .collect();
+
+        let mut default_det = StreamingDetector::new(200.0, 250);
+        let default_cps = default_det.step(&data);
+
+        let mut identity_det =
+            StreamingDetector::new(200.0, 250).with_transform(PriceTransform::Identity);
+        let identity_cps = identity_det.step(&data);
+
+        assert_eq!(
+            default_cps.len(),
+            identity_cps.len(),
+            "Identity must produce same number of change points as default"
+        );
+        for (d, i) in default_cps.iter().zip(identity_cps.iter()) {
+            assert_eq!(d.index, i.index, "Identity cp index must match default");
+            assert_eq!(
+                d.confidence, i.confidence,
+                "Identity cp confidence must match default"
+            );
+            assert_eq!(
+                d.shift_sigma, i.shift_sigma,
+                "Identity shift_sigma must match default"
+            );
+        }
+        assert_eq!(
+            default_det.save_state().map_rls,
+            identity_det.save_state().map_rls,
+            "Identity map_rls must match default"
+        );
+    }
+
+    #[test]
+    fn transform_logit_operates_on_different_scale_than_identity() {
+        // Logit maps sub-cent prices into log-odds space. After feeding the
+        // same sub-cent prices through both transforms, the Welford running
+        // mean must differ dramatically -- Identity tracks the raw price
+        // (~0.0075) while Logit tracks the log-odds (~-4.95).
+        let data: Vec<f64> = (0..300)
+            .map(|i| if i < 150 { 0.005_f64 } else { 0.010_f64 })
+            .collect();
+
+        let mut identity_det = StreamingDetector::new(200.0, 250);
+        identity_det.step(&data);
+        let id_mean = identity_det.save_state().welford.mean;
+
+        let mut logit_det =
+            StreamingDetector::new(200.0, 250).with_transform(PriceTransform::Logit);
+        logit_det.step(&data);
+        let lg_mean = logit_det.save_state().welford.mean;
+
+        // Identity mean ≈ 0.0075 (raw price); Logit mean ≈ -4.95 (log-odds).
+        assert!(
+            (id_mean - lg_mean).abs() > 1.0,
+            "Welford means must differ by >1.0 (identity≈0.0075 vs logit≈-4.95), got {id_mean} vs {lg_mean}"
+        );
+    }
+
+    #[test]
+    fn transform_logit_round_trips_through_save_restore() {
+        let data = vec![0.3_f64; 80];
+        let mut det =
+            StreamingDetector::new(200.0, 250).with_transform(PriceTransform::Logit);
+        det.step(&data);
+
+        let state = det.save_state();
+        assert_eq!(state.transform, PriceTransform::Logit, "state must carry Logit");
+
+        let restored = StreamingDetector::restore(state).unwrap();
+        let mut state_json = serde_json::to_value(restored.save_state()).unwrap();
+
+        // Forward-compat: a snapshot without transform support has no `transform` field.
+        // After dropping it the detector should restore as Identity.
+        state_json.as_object_mut().unwrap().remove("transform");
+        let compat: DetectorState = serde_json::from_value(state_json).unwrap();
+        assert_eq!(
+            compat.transform,
+            PriceTransform::Identity,
+            "missing transform field must default to Identity"
+        );
+    }
+
+    #[test]
+    fn logit_apply_is_monotone_and_finite_on_interior() {
+        // Basic sanity on PriceTransform::Logit.apply: monotone, finite,
+        // symmetric around 0.5, and no ±inf on near-boundary inputs.
+        let t = PriceTransform::Logit;
+        assert!(t.apply(0.0).is_finite(), "logit(0) must be clamped finite");
+        assert!(t.apply(1.0).is_finite(), "logit(1) must be clamped finite");
+        assert_eq!(t.apply(0.5), 0.0, "logit(0.5) = 0");
+        assert!(t.apply(0.3) < 0.0, "logit(0.3) < 0");
+        assert!(t.apply(0.7) > 0.0, "logit(0.7) > 0");
+        // Monotone: logit(0.3) < logit(0.5) < logit(0.7)
+        assert!(t.apply(0.3) < t.apply(0.5));
+        assert!(t.apply(0.5) < t.apply(0.7));
     }
 }

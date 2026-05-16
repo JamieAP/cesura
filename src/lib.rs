@@ -70,6 +70,7 @@ pub use multistream::{
 pub use nig::Nig;
 pub use nig_ar1::NigAr1;
 pub use predictive::Predictive;
+pub use streaming::{PriceTransform, StreamingDetector};
 pub(crate) use math::{lgamma, log_add_exp};
 
 /// A detected change point with its index and confidence score.
