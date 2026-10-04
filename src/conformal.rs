@@ -30,10 +30,46 @@
 //!
 //! ## Coverage semantics
 //!
+//! The wrapper ships **marginal-across-regimes** calibration: a single
+//! rolling-FIFO buffer accumulates non-conformity scores from every
+//! emitted CP, regardless of which regime they originated from.
+//! Sun & Yu 2025 (CPTC, arXiv:2509.02844) §4.1 names this the naive
+//! case for online streams whose data distribution shifts; their fix
+//! is per-regime ACI-style adaptation for forecast intervals (the
+//! method is for *forecasting* prediction intervals on time-series
+//! with CPs, not timing-uncertainty for CP detectors -- it is
+//! adjacent prior art, not a direct timing-CP follow-up). One
+//! mitigation specific to this wrapper: scores enter the buffer only
+//! at *triggered* CPs, so quiet-period contamination is auto-rejected;
+//! the residual hazard is mixing scores across regimes of differing
+//! signal magnitude. Marginal-coverage parity across an SNR
+//! transition is pinned by
+//! `tests/statistical.rs::conformal_wrapper_coverage_under_snr_transition`.
+//! Per-regime conditioning is a possible extension.
 //!
+//! Bayesian dual: arXiv:2508.06385 (Aug 2025) proposes a credible
+//! interval on BOCPD's MAP run length `r* = argmax_r p(r_t = r | y_{1:t})`
+//! directly from the posterior, avoiding any calibration buffer.
+//! Coverage there is posterior, conditional on model correctness
+//! rather than score exchangeability.
 //!
 //! ## Score semantics
 //!
+//! [`ScoredDetect`]'s scalar must be on a scale comparable across CPs
+//! from the same detector instance. For [`crate::BocpdDetector`] the
+//! score is the **trigger-to-CP-mass-peak offset**
+//! `i − argmax_{k ∈ lookback} P(r_k = 0 | y_{1:k}) ≥ 0`, where the
+//! lookback is the cooldown window. This is the time step within the
+//! lookback at which BOCPD's per-step run-length-zero posterior was
+//! largest -- i.e. the model's **MAP CP-trigger time** within the
+//! window. (This is *not* the standard MAP run length
+//! `r* = argmax_r p(r_t = r | y_{1:t})`; the score takes argmax over
+//! `t` at fixed `r = 0`, not over `r` at fixed `t`. The two are
+//! related but distinct quantities -- see Adams & MacKay 2007 for
+//! the run-length posterior, and arXiv:2508.06385 for the Bayesian
+//! credible-interval angle.) Exchangeability across regimes is an assumption;
+//! synthetic regression tests do not establish a statistical coverage guarantee
+//! for arbitrary streams.
 //!
 //! The wrapper's `timing_interval` is `(i − q_high, i − q_low)`, an
 //! absolute-index range that brackets the MAP CP-trigger time, not
@@ -202,12 +238,8 @@ impl<D: MvScoredDetect> ConformalCpWrapper<D> {
 /// Rolling-FIFO buffer with a sorted side-vector. `O(log n)`
 /// binary-search to find insert/remove positions plus an `O(n)`
 /// `Vec::insert`/`Vec::remove` shift; quantile lookup is `O(1)`.
-/// At cap ≤ 1000 the per-push cost is dominated by the BOCPD inner
-/// loop, so the linear shift is not the bottleneck. A two-heap or
-/// t-digest swap (`datasketches-rust` is the maintained option;
-/// `tdigests` was archived Feb 2026) only wins at cap > 10k where
-/// the bounded-memory + log-n insert matter; the wrapper API is
-/// invariant under that swap.
+/// Linear shifts may be expensive at large capacity; alternative data
+/// structures require profiling on the intended workload.
 struct RingBuffer {
     cap: usize,
     fifo: std::collections::VecDeque<f64>,

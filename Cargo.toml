@@ -124,3 +124,7 @@ name = "detectors_throughput"
 harness = false
 required-features = ["test-utils"]
 
+
+[[test]]
+name = "streaming_dm_bocd"
+required-features = ["test-utils"]

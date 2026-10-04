@@ -170,6 +170,12 @@ pub fn render_attribution(rows: &[AttributionRow]) -> String {
 /// Asset-name resolver: `(fixture_name, stream_index) → display name`.
 type AssetNameFn<'a> = Box<dyn Fn(&str, usize) -> String + 'a>;
 
+/// Unified evaluation API. Every consumer of the bench
+/// surface routes through this builder so detector × fixture
+/// comparisons are apples-to-apples by construction. Replaces
+/// the per-example `bench()` shape (manual `let mut all = Vec::new()`
+/// plus per-cell `run_bench` / `write_report` / `classify_verdict` /
+/// `render_markdown` glue) with a single canonical pipeline.
 ///
 /// The builder owns:
 /// - `intro`: the section text emitted ahead of the audit trail block
@@ -339,6 +345,10 @@ pub struct Verdict {
     pub n_events_used: usize,
 }
 
+/// `classify_verdict`-equivalent label derived from a single
+/// `n_events` count, *without* needing a Report. Used by banner
+/// labels in regenerated markdowns so the power-class string is a
+/// `classify_verdict` output by construction.
 pub fn power_label(n_events: usize, min_events: usize) -> VerdictLabel {
     if n_events < min_events {
         VerdictLabel::SanityCheck

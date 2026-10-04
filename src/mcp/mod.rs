@@ -1,3 +1,4 @@
+//! cesura-mcp stdio MCP server. Gate: `feature = "mcp"`.
 
 pub mod registry;
 pub mod server;

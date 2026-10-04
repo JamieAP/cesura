@@ -1,9 +1,8 @@
-//! PrO-BOCD -- Predictively-Oriented BOCD (Knoblauch et al., 2025/2026,
-//! arXiv:2510.01915).
+//! Predictively-Oriented BOCD (Knoblauch et al., arXiv:2510.01915).
 //!
-//!
-//!
-//!
+//! Particle posterior, Langevin sampling, and batch detection.
+//! Sampling introduces Monte Carlo variability; seeded APIs support repeatable
+//! evaluation. Hyperparameters should be calibrated for each application.
 
 pub mod detect;
 pub mod langevin;
@@ -11,9 +10,7 @@ pub mod posterior;
 
 /// Predictively-Oriented BOCD detector.
 ///
-/// Configuration container for the recursion implemented in the detect module.
-/// Holds run-length, particle-count, Langevin step-size, and noise
-/// hyperparameters.
+/// Holds run-length, particle-count, and Langevin hyperparameters.
 pub struct PrOBocpdDetector {
     pub lambda: f64,
     pub max_rl: usize,

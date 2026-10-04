@@ -57,6 +57,8 @@ impl<P: Predictive> CpDetector for BocpdAdapter<'_, P> {
 /// whitening preamble disabled. Wraps
 /// [`BocpdDetector::detect_multivariate_no_whiten`].
 ///
+/// Evaluates joint NIW on per-dimension normalized data, allowing comparison
+/// with the whitened variant.
 ///
 /// Same `P`-agnostic caveat as [`BocpdAdapter`] with `mv: true`: the
 /// underlying recursion is hard-coded NIW regardless of `P`.
@@ -76,6 +78,9 @@ impl<P: Predictive> CpDetector for BocpdJointZnormAdapter<'_, P> {
 
 /// Bench adapter for [`crate::pro_bocd::PrOBocpdDetector`].
 ///
+/// Wraps `detect_multivariate_seeded(data, seed)` so seeded sweeps
+/// share infrastructure with the other detector adapters. Callers can
+/// provide the same seed schedule for comparisons across detectors.
 pub struct PrOBocpdAdapter<'a> {
     pub det: &'a crate::pro_bocd::PrOBocpdDetector,
     pub seed: u64,

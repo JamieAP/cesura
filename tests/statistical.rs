@@ -1,4 +1,4 @@
-//! Production statistical test suite.
+//! Synthetic statistical test suite.
 //!
 //! Black-box tests that verify the detector's *operating characteristics* --
 //! the properties a quant or ML practitioner must check before trusting it
@@ -16,11 +16,6 @@ use cesura::chen_wu::{ChenWuDetector, Detection};
 
 // ── ARL₀: average run length to false alarm under H0 ─────────────────
 
-/// Mean number of observations between false alarms on stationary N(0, 1).
-///
-/// Higher λ ⇒ higher ARL₀ ⇒ fewer false alarms. The classical CUSUM/EWMA
-/// quality metric. We assert ordering and a loose lower bound; tight numerics
-/// are unstable across seeds.
 #[test]
 fn arl0_increases_with_lambda() {
     let trials = 50;
@@ -61,8 +56,6 @@ fn arl0_increases_with_lambda() {
 
 // ── Operating characteristic: detection delay vs shift ───────────────
 
-/// Mean detection delay should decrease monotonically as shift grows.
-/// This is the curve a practitioner reads off the spec.
 #[test]
 fn detection_delay_decreases_with_shift_size() {
     let trials = 40;
@@ -117,7 +110,7 @@ fn detection_delay_decreases_with_shift_size() {
         report[3].2,
         report[1].2
     );
-    // Production budget: 5σ shift detected within 25 steps on average.
+    // Regression budget: 5σ shift detected within 25 steps on average.
     assert!(
         report[3].2 < 25.0,
         "5σ mean delay {} > 25 -- slower than acceptable",
@@ -127,11 +120,6 @@ fn detection_delay_decreases_with_shift_size() {
 
 // ── Regression snapshot: pinned indices for a fixed seed ─────────────
 
-/// Lock the detector's behavior on a fixed-seed three-regime scenario.
-/// Any change in the algorithm -- even a "harmless" tweak -- fires this.
-///
-/// Regenerate after deliberate algorithm changes: run the test once,
-/// copy the printed `[…]` into `EXPECTED`.
 #[test]
 fn regression_snapshot_three_regime() {
     // Fixed scenario: N(0,1) for 100, then N(4,1) for 100, then N(0,1) for 100.
@@ -166,9 +154,6 @@ fn regression_snapshot_three_regime() {
 
 // ── CUSUM baseline comparison ────────────────────────────────────────
 
-/// Two-sided CUSUM with parameters (k, h) on standardized residuals.
-/// Estimates running mean/std from a warmup window, then emits an alarm
-/// when |S±| > h. Reference: Page (1954); Lai (1995) survey.
 fn cusum_detect(data: &[f64], k: f64, h: f64, warmup: usize) -> Vec<usize> {
     if data.len() <= warmup {
         return vec![];
@@ -197,10 +182,6 @@ fn cusum_detect(data: &[f64], k: f64, h: f64, warmup: usize) -> Vec<usize> {
     out
 }
 
-/// BOCPD must not collapse against a strong classical baseline.
-/// CUSUM is well-tuned for known mean shifts and routinely competitive;
-/// a credible BOCPD implementation should at minimum match its aggregate F1
-/// on a heterogeneous suite (mean shifts + variance + periodic patterns).
 #[test]
 fn bocpd_matches_or_beats_cusum_aggregate() {
     let scenarios = eval::all_scenarios();
@@ -643,20 +624,6 @@ fn ensemble_vote_grid_probe() {
     eprintln!("DELTA = {:+.4}", best_f1 - baseline_f1);
 }
 
-// ── 3-way ensemble probe ─────────────────────────────────────────────
-//
-// Extend the 2-way (BOCPD + FOCuS) comparison with Chen & Wu's
-// CP emissions as a third confirmation arm. Hypothesis: Chen & Wu
-// (Bayesian, anomaly-aware) catches the same regime shifts BOCPD
-// catches but rejects collective anomalies BOCPD treats as CPs --
-// that anomaly-rejection is precisely the signal a confirmation arm
-// adds. Two rules tested:
-//
-//   - AND-3:  BOCPD ∧ FOCuS ∧ ChenWu        (strict, max precision)
-//   - COC3:   conf >= floor                  (high-conf passthrough)
-//             ∨ FOCuS confirms within tol
-//             ∨ ChenWu CP confirms within tol  (loose-OR confirmation)
-//
 #[cfg(feature = "joint-detection")]
 #[test]
 fn ensemble_three_way_probe() {
@@ -734,6 +701,7 @@ fn ensemble_three_way_probe() {
         })
         .collect();
 
+    // Baseline: BOCPD alone, COC2 (iter 1 winner).
     let bocpd_only: Vec<Vec<usize>> = bocpd_per_scenario
         .iter()
         .map(|v| v.iter().map(|&(i, _)| i).collect())
@@ -831,13 +799,6 @@ fn ensemble_three_way_probe() {
     );
 }
 
-///
-/// Three modes:
-/// - raw: BOCPD on raw data (current default, baseline)
-/// - autodetrend: if `dominant_period_via_acf` returns Some, fit
-///   `Detrender` and run BOCPD on `detrend_diff`. Else fall back to raw.
-/// - always_diff: force `seasonal_difference(period=ACF or 24)`
-///   regardless of ACF strength. Diagnostic only.
 #[test]
 fn detrending_integration_probe() {
     let scenarios = eval::all_scenarios();
@@ -967,8 +928,6 @@ fn detrend_ensemble_meets_floor() {
     );
 }
 
-/// Iter-6 follow-on: compose detrending + COC2 ensemble. If both
-/// levers move the dial independently, applying both should compound.
 #[test]
 fn detrend_plus_ensemble_probe() {
     let scenarios = eval::all_scenarios();
@@ -1177,9 +1136,6 @@ fn alt_confidence_summary_calibration_probe() {
     }
 }
 
-/// Iter-4 sanity check on detect_viterbi: clean two-regime shift.
-/// One CP at index 100 in 200 samples. MAP-drop catches it; Viterbi
-/// must not return 0 or 50 CPs.
 #[test]
 fn viterbi_clean_shift_sanity() {
     let mut data: Vec<f64> = (0..100).map(|_| 0.0).collect();
@@ -1293,12 +1249,6 @@ fn viterbi_vs_mapdrop_aggregate() {
     }
 }
 
-/// Iter-4 probe. The MAP-drop heuristic emits CPs with a `confidence`
-/// derived from `peak P(r_t = 0)` over the cooldown window. KNOWN_LIMITATIONS
-/// flags this as permissive; COMPARISON.md proposes a Viterbi backward
-/// pass for calibrated confidence. Before implementing Viterbi, ask: is
-/// the existing confidence already informative?
-///
 #[test]
 fn confidence_calibration_probe() {
     let scenarios = eval::all_scenarios();
@@ -1540,7 +1490,6 @@ fn confidence_is_calibrated() {
 
 // ── Per-scenario operational F1 floors ───────────────────────────────
 
-///
 #[test]
 fn eval_operational_per_scenario_floors() {
     use cesura::eval::match_detections;
@@ -1768,9 +1717,7 @@ fn auto_beta_picks_robust_for_t3() {
     );
 }
 
-// ── AR(1)-BOCPD floors ──────────────────────────────
 
-/// Generate an AR(1) sequence x_t = a + b · x_{t-1} + ε_t with no CPs.
 fn ar1_sequence(n: usize, a: f64, b: f64, sigma: f64, seed: u64) -> Vec<f64> {
     let mut rng = Rng::new(seed);
     let mut data = Vec::with_capacity(n);
@@ -1785,10 +1732,6 @@ fn ar1_sequence(n: usize, a: f64, b: f64, sigma: f64, seed: u64) -> Vec<f64> {
 
 #[test]
 fn bocpd_ar1_on_ar1_process_vs_nig() {
-    // Headline gain: AR(1) within-regime is the matched model on AR(1)
-    // data, so its false-alarm rate must be materially lower than the
-    // NIG (iid-Gaussian) detector on the same streams. Comparison floor:
-    // `ar1_fp <= nig_fp / 2`.
     use cesura::NigAr1;
     let trials = 30;
     let length = 600;
@@ -1819,16 +1762,6 @@ fn bocpd_ar1_on_ar1_process_vs_nig() {
 
 #[test]
 fn bocpd_ar1_detects_shift_in_ar1_process() {
-    // Matched-model-with-signal: AR(1) data with a real intercept shift
-    // mid-stream. The matched-model NigAr1 must NOT be blind to this
-    // shift -- if it were, the FP reduction shown in
-    // `bocpd_ar1_on_ar1_process_vs_nig` would be partly missed CPs in
-    // disguise.
-    //
-    //
-    // Pin: AR(1) detection rate ≥ ½ × NIG detection rate, AND
-    //      AR(1) must detect at least 5/20 trials (not blind).
-    //      Detection delay (when fired) must be ≤ 50 steps.
     use cesura::NigAr1;
     let mut ar1_hits = 0;
     let mut nig_hits = 0;
@@ -2003,11 +1936,7 @@ fn ar1_eval_aggregate_meets_floor() {
     );
 }
 
-// ── ConformalCpWrapper ──────────────────────────────────────
 
-/// Bit-equality: wrapper-emitted CP indices match the unwrapped
-/// `BocpdDetector::detect` output. Guards against accidental drop /
-/// reorder in the `ScoredDetect` impl.
 #[test]
 fn conformal_wrapper_preserves_detection() {
     use cesura::{BocpdDetector, ConformalCpWrapper, ScoredDetect};
@@ -2033,16 +1962,6 @@ fn conformal_wrapper_preserves_detection() {
     assert_eq!(baseline, conformal, "wrapper must preserve detect() indices");
 }
 
-/// Empirical coverage on the score's reference point (BOCPD's MAP-
-/// collapse step `t_collapse`). For each post-warmup CP, the wrapper's
-/// timing interval must contain `t_collapse = cp.index − score`.
-///
-/// Coverage is asserted against `t_collapse`, not the latent "true CP",
-/// because the score directly calibrates the trigger-to-collapse offset
-/// distribution. The detection-lag bias between `t_collapse` and the
-/// latent CP is a separate uncalibrated quantity; CPTC-style
-/// regime-state-conditional calibration (Sun & Yu 2025) is the
-/// follow-up that addresses it.
 #[test]
 fn conformal_wrapper_coverage_is_nominal() {
     use cesura::{BocpdDetector, ConformalCpWrapper, ScoredDetect};
@@ -2111,9 +2030,6 @@ fn conformal_wrapper_coverage_is_nominal() {
     );
 }
 
-/// Calibration-buffer warmup: interval-width variance over the second
-/// 100 CPs (rolling) should be tighter than over the first 100 CPs
-/// (filling) by at least a factor of 5.
 #[test]
 fn conformal_calibration_buffer_grows_then_stabilises() {
     use cesura::{BocpdDetector, ConformalCpWrapper};
@@ -2161,7 +2077,6 @@ fn conformal_calibration_buffer_grows_then_stabilises() {
     );
 }
 
-/// Smoke test: wrapper composes over the ensemble.
 #[test]
 fn conformal_wrapper_works_over_ensemble() {
     use cesura::{ConformalCpWrapper, EnsembleDetector};
@@ -2179,9 +2094,6 @@ fn conformal_wrapper_works_over_ensemble() {
     }
 }
 
-///
-/// Per-regime conditioning (CPTC-style) is a possible extension; if
-/// this test ever fails, that's the natural escalation.
 #[test]
 fn conformal_wrapper_coverage_under_snr_transition() {
     use cesura::{BocpdDetector, ConformalCpWrapper, ScoredDetect};

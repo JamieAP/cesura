@@ -562,6 +562,8 @@ fn cesura_list_and_close_streams() {
 
 #[test]
 fn malformed_frame_replies_parse_error_and_channel_survives() {
+    // Wrapper-transport invariant (see
+    // `src/mcp/transport.rs` and
     //
     //   (1) malformed line → server replies a JSON-RPC `-32700 Parse
     //       error` frame with `id: null`.

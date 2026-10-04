@@ -100,6 +100,12 @@ impl Detrender {
 
     /// Remove seasonal + trend components, returning residuals.
     ///
+    /// `start_offset` is the *absolute* position of `data[0]` measured from
+    /// the start of the fit window (e.g., for a continuation immediately
+    /// following the fit data, `start_offset = fit_len`). Used for both
+    /// seasonal phase (`(start_offset + i) % period`) and trend baseline
+    /// (`trend * (start_offset + i)`). Pass `0` when detrending the same
+    /// data the model was fit on.
     pub fn detrend(&self, data: &[f64], start_offset: usize) -> Vec<f64> {
         data.iter()
             .enumerate()

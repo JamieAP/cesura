@@ -1,5 +1,6 @@
-//! Auto-tune β-divergence robustness from a warmup window's kurtosis.
-//!
+//! Heuristic beta-divergence tuning from warmup sample excess kurtosis.
+//! A Gaussian has population kurtosis 3. Fourth-moment estimates can be noisy
+//! on short or heavy-tailed windows; this capped mapping requires calibration.
 
 /// Sample excess kurtosis (`E[(X-μ)⁴]/σ⁴ − 3`). Returns `0.0` for n < 4
 /// or zero variance (degenerate input → no signal, no β).
@@ -39,9 +40,18 @@ pub fn excess_kurtosis(data: &[f64]) -> f64 {
 ///
 /// `β = clamp(SLOPE · max(0, k_ex − DEAD_ZONE), 0.0, BETA_MAX)`.
 ///
+/// `DEAD_ZONE = 1.0` suppresses beta tuning below this excess-kurtosis
+/// threshold. It is a heuristic parameter, not a distributional bound.
 ///
+/// `SLOPE = 0.030` controls the response above the dead zone.
+/// The mapping is a heuristic rather than a calibrated market-data guarantee.
 ///
+/// `BETA_MAX = 0.20` caps the beta parameter. The predictive Gaussian
+/// approximation to the Student-t beta-power integral still requires validation
+/// for the intended distribution.
 ///
+/// Synthetic calibration probes are retained in `tests/statistical.rs`.
+/// Recalibrate when the intended noise distribution changes.
 pub fn beta_from_excess_kurtosis(k_ex: f64) -> f64 {
     const SLOPE: f64 = 0.030;
     const DEAD_ZONE: f64 = 1.0;

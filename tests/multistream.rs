@@ -7,6 +7,12 @@
 //! statistical behavior is tested against scripted streams in the
 //! unit suites (`src/multistream/{hc,sum_cusum}.rs`).
 //!
+//! Real-data calibration (HC threshold tuning vs StreamingDetector's
+//! BF/cp_probs distribution; persistence-filter to distinguish
+//! transient noise from sustained shifts; per-application false-alarm
+//! rate calibration) is not covered by this suite. The
+//! integration tests here verify the COUPLING is correct, not that
+//! defaults are well-tuned for any specific fixture.
 
 #![cfg(feature = "test-utils")]
 
@@ -127,6 +133,8 @@ fn sum_cusum_save_restore_round_trips_with_real_streams() {
 #[test]
 #[ignore]
 fn detection_delta_persistence_levels() {
+    // Sparse detection rate as a function of persistence -- pair
+    // with far_delta to see the FAR/detection tradeoff.
     let seeds: [u64; 5] = [7, 11, 17, 23, 31];
     let thresholds = [2.0, 3.0, 5.0];
     let persistences = [1usize, 2, 3];
@@ -159,6 +167,11 @@ fn detection_delta_persistence_levels() {
 #[test]
 #[ignore]
 fn far_delta_persistence_levels() {
+    // Real-data FAR comparison: HC over BF streams on 5 stationary
+    // seeds × 300 steps, sweep persistence ∈ {1, 2, 3} at τ ∈
+    // {2.0, 3.0, 5.0}. Reports total fires per setting so we can
+    // confirm persistence actually reduces FAR before shipping the
+    // feature.
     let seeds: [u64; 5] = [7, 11, 17, 23, 31];
     let thresholds = [2.0, 3.0, 5.0];
     let persistences = [1usize, 2, 3];

@@ -116,6 +116,11 @@ impl FocusDetector {
 
     /// Opt into the functional-pruning inner loop (Romano et al. 2023).
     ///
+    /// Replaces the O(t) per-step argmax scan with two monotone deques.
+    /// Per-step work is amortised O(1) for pruning + O(|deque|) for the
+    /// query; the deque size is O(log t) on average under H₀, O(t)
+    /// worst-case. Detection semantics are bit-for-bit identical to the
+    /// naive path -- enforced by `tests/focus.rs` parity tests.
     ///
     /// Use for long streams (t ≥ 10^4); the naive path is faster on
     /// short streams due to lower constants.
@@ -234,6 +239,15 @@ impl FocusDetector {
     /// (default 25, matching `EnsembleDetector`'s confirmation
     /// tolerance).
     ///
+    /// **This is structurally weaker than `BocpdDetector::detect_multivariate`**
+    /// on correlated input: per-dim z-norm misses anti-correlated
+    /// shifts that the Mahalanobis path catches (see the correlated-shift
+    /// tests in `tests/correctness.rs`). The MV FOCuS pitch is
+    /// "frequentist parallel detector for users who don't want a
+    /// Bayesian prior", not "best multivariate detector". The
+    /// Pishchagina et al. 2024 (arXiv:2311.01174) convex-hull MV
+    /// FOCuS is a separate algorithm and is **not** what this method
+    /// implements.
     ///
     /// Empty input or ragged dimensions return an empty vec.
     pub fn detect_multivariate(&self, data: &[Vec<f64>]) -> Vec<ChangePoint> {

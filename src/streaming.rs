@@ -38,10 +38,10 @@ pub struct DetectorState {
     #[serde(default)]
     pub bf_rule: Option<BfRuleState>,
     /// Optional pre-detector observation transform. `Identity` (default)
-    /// preserves byte-identical behaviour with snapshots without transform support.
+    /// preserves byte-identical behaviour with earlier snapshots.
     /// `Logit` unbounds prices in (0, 1) for use against the NIG/NIW
-    /// Gaussian likelihood; intended for bounded-data callers (Polymarket).
-    /// Forward-compat: snapshots without transform support default to Identity.
+    /// Gaussian likelihood; intended for bounded-data callers (for example, probabilities).
+    /// Forward-compat: earlier snapshots default to Identity.
     #[serde(default)]
     pub transform: PriceTransform,
 }
@@ -49,15 +49,16 @@ pub struct DetectorState {
 /// Observation-stream transform applied before BOCPD sees the data.
 ///
 /// `Identity` is the default and preserves byte-identical behaviour with
-/// existing callers (crypto trade-tick pipelines). `Logit` is intended
+/// existing callers. `Logit` is intended
 /// for bounded callers whose prices live in (0, 1); it unbounds the
 /// stream so the NIG/NIW Gaussian likelihood is less misspecified near
 /// the boundaries.
 ///
+/// Bounded probabilities can be transformed with Logit before Gaussian modeling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum PriceTransform {
-    /// No transform. Default. Behaviour identical to cesura with no transform.
+    /// No transform. Default. Behaviour identical to earlier cesura.
     #[default]
     Identity,
     /// `y = log(x / (1 - x))`, clamped to a tiny epsilon away from 0 and 1
@@ -251,7 +252,7 @@ pub struct StreamingDetector {
     /// Bayes-factor rule state. `None` ⇒ MAP-drop trigger (default).
     bf_rule: Option<BfRuleState>,
     /// Pre-detector observation transform. `Identity` by default;
-    /// `Logit` for bounded-data callers (Polymarket).
+    /// `Logit` for bounded-data callers (for example, probabilities).
     transform: PriceTransform,
 }
 
@@ -345,8 +346,8 @@ impl StreamingDetector {
     /// Set the pre-detector observation transform.
     ///
     /// `Identity` (default) preserves byte-identical behaviour with
-    /// callers without transform support. `Logit` unbounds prices in (0, 1) for use
-    /// against the NIG Gaussian likelihood (Polymarket).
+    /// earlier callers. `Logit` unbounds prices in (0, 1) for use
+    /// against the NIG Gaussian likelihood (for example, probabilities).
     pub fn with_transform(mut self, transform: PriceTransform) -> Self {
         self.transform = transform;
         self
@@ -474,7 +475,7 @@ impl StreamingDetector {
                 continue;
             }
             // Pre-detector transform. `Identity` is a no-op pass-through
-            // (byte-identical to untransformed behavior); `Logit` unbounds
+            // (byte-identical to earlier behaviour); `Logit` unbounds
             // x ∈ (0, 1) for the Gaussian likelihood.
             let x = self.transform.apply(x);
             if !x.is_finite() {
@@ -1300,6 +1301,7 @@ mod tests {
             elapsed,
             elapsed.as_secs_f64() * 1000.0
         );
+        // Synthetic latency budget for the test profile; hardware affects elapsed time.
         assert!(
             elapsed.as_millis() < 60,
             "streaming tick took {}ms, need <60ms (debug) / <10ms (release)",
@@ -1643,7 +1645,7 @@ mod tests {
         let restored = StreamingDetector::restore(state).unwrap();
         let mut state_json = serde_json::to_value(restored.save_state()).unwrap();
 
-        // Forward-compat: a snapshot without transform support has no `transform` field.
+        // Forward-compat: a earlier snapshot has no `transform` field.
         // After dropping it the detector should restore as Identity.
         state_json.as_object_mut().unwrap().remove("transform");
         let compat: DetectorState = serde_json::from_value(state_json).unwrap();

@@ -10,12 +10,7 @@
 //!
 //! The pre-condition for either branch is a BOCPD emission; FOCuS does
 //! not contribute novel detections, only suppresses solo low-confidence
-//! BOCPD calls. Calibrate the confirmation threshold and tolerance
-//! on representative fixtures before choosing an ensemble policy.
-//!
-//!
-//!
-//!
+//! BOCPD calls. Tune the confidence floor and tolerance for the intended workload.
 
 use crate::bocpd::BocpdDetector;
 use crate::conformal::{MvScoredDetect, ScoredDetect};
@@ -32,6 +27,8 @@ use crate::ChangePoint;
 /// step-distance between a BOCPD index and a FOCuS index for the latter
 /// to count as confirmation.
 ///
+/// Defaults: `focus_threshold = 8.0`, `confidence_floor = 0.40`,
+/// `tolerance = 25`. These are starting points for calibration.
 pub struct EnsembleDetector<P: Predictive = Nig> {
     bocpd: BocpdDetector<P>,
     focus_threshold: f64,
@@ -84,8 +81,11 @@ impl<P: Predictive> EnsembleDetector<P> {
         self
     }
 
+    /// Apply seasonal differencing before running the BOCPD + FOCuS
+    /// recursion when an ACF-dominant period is detected. Falls through
+    /// to raw input on aperiodic streams.
     ///
-    ///
+    /// Calibrate on representative stationary and shifted fixtures.
     pub fn with_auto_detrend(mut self, on: bool) -> Self {
         self.auto_detrend = on;
         self
@@ -177,6 +177,17 @@ impl<P: Predictive> ScoredDetect for EnsembleDetector<P> {
     /// follow [`BocpdDetector::detect_with_score`]: trigger-to-MAP-CP
     /// offset on the **working series**.
     ///
+    /// When [`with_auto_detrend`](Self::with_auto_detrend) is enabled,
+    /// the BOCPD recursion runs on the seasonally-differenced series
+    /// and the score is measured in *that* index space. The emitted
+    /// `cp.index` is shifted back into the original series, but the
+    /// score itself is not re-mapped -- arithmetically the score is
+    /// shift-invariant, but semantically a calibration buffer
+    /// accumulating scores from a mix of detrended and non-detrended
+    /// runs (e.g. an instance reused across calls with different
+    /// detected periods) is incoherent. Use a fresh
+    /// [`crate::ConformalCpWrapper`] per detrend regime when this
+    /// matters.
     fn detect_with_score(&self, data: &[f64]) -> Vec<(ChangePoint, f64)> {
         let (working_data, shift): (std::borrow::Cow<'_, [f64]>, usize) = if self.auto_detrend {
             match dominant_period_via_acf(data) {
@@ -333,6 +344,8 @@ mod tests {
         }
         let det = EnsembleDetector::new(200.0, 350);
         let cps = det.detect_multivariate(&data);
+        // The ensemble should inherit a detection near the synthetic change
+        // through the confidence-floor branch.
         assert!(
             cps.iter().any(|c| (c.index as i64 - 200).abs() < 50),
             "MV ensemble should inherit BOCPD's anti-correlated catch via confidence-floor branch; got {:?}",

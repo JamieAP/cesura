@@ -2,6 +2,17 @@
 //! `SumCusumAggregator`) to [`CpDetector`] without touching their public
 //! APIs. Pure dispatch wrappers.
 //!
+//! Adapter caveats:
+//! - Each `detect(&self, fix)` rebuilds streams + aggregator from
+//!   scratch via the stored factory + configurators. Each
+//!   `(seed, threshold, persistence)` cell uses fresh state. Threshold
+//!   sweeps therefore spawn N adapter instances rather than mutating
+//!   one.
+//! - `MultiStreamChangePoint.streams` (per-stream attribution) is
+//!   dropped when projecting to `ChangePoint`. Same information-loss
+//!   pattern as `ChenWuAdapter` dropping `CollectiveAnomaly`.
+//! - `&self` contract on `CpDetector` is preserved by burying mutable
+//!   aggregator state inside the per-call rebuild.
 
 use crate::bench::detector::{CpDetector, DetectionResult};
 use crate::bench::fixture::Fixture;
@@ -30,6 +41,7 @@ fn project_with_attribution(
 /// trait objects across threads if a future caller wants that.
 pub type StreamFactory = Box<dyn Fn(usize) -> Vec<StreamingDetector> + Send + Sync>;
 
+/// Convenience factory for fresh BF-rule streaming detectors.
 pub fn make_bf_streams_factory() -> StreamFactory {
     Box::new(|d| {
         (0..d)
@@ -38,6 +50,7 @@ pub fn make_bf_streams_factory() -> StreamFactory {
     })
 }
 
+/// Convenience factory for fresh MAP-rule streaming detectors.
 pub fn make_map_streams_factory() -> StreamFactory {
     Box::new(|d| (0..d).map(|_| StreamingDetector::new(200.0, 250)).collect())
 }

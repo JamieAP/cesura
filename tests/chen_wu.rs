@@ -186,6 +186,18 @@ fn paper_section_6_1_fixture_qualitative() {
         cp_indices.len()
     );
 
+    // Regression snapshot. Pins the exact CP indices from this specific
+    // seed + hyperparameter combination. A change here that doesn't also
+    // come with a deliberate fixture update means a recursion-level
+    // regression -- e.g. an off-by-one in the predictive, a renorm bug,
+    // or wrong r* selection. Update intentionally; do not weaken to
+    // `<=` set membership.
+    // Snapshot updated when the inside_emitted_anomaly heuristic was
+    // replaced by paper § 4.3 Υ_c^t persistence (v0.8). The previous
+    // ±2-window CP suppression around emitted anomalies is gone; CPs
+    // that fire one paper-step before an anomaly start now surface
+    // (147, 747, 847). The over-detection cap (10) still gates this --
+    // recall is unchanged at 6/6 truth points within ±25 obs.
     assert_eq!(
         cp_indices,
         vec![0, 75, 147, 175, 300, 452, 625, 747, 825, 847],

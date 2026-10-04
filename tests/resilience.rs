@@ -349,6 +349,7 @@ fn detrender_update_does_not_drift_over_long_stream() {
          tail residual mean (offset): {mean_tail:.2}  (linearly grows with t -- documented limitation)"
     );
 
+    // Regression invariant: seasonal updates should bound residual variance.
     assert!(
         ratio < 2.5,
         "tail residual variance {var_tail:.4} > 5x post-fit {var_fit:.4} (ratio={ratio:.2}) \

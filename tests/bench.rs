@@ -1,3 +1,6 @@
+//! Unit and integration coverage for the
+//! `cesura::bench` module: trait dispatch, F1-with-margin metric,
+//! verdict floor, JSON round-trip, and synthetic FixtureRegistry.
 
 #![cfg(feature = "test-utils")]
 
@@ -57,6 +60,11 @@ fn evaluate_far_outside_margin_counts_as_fp() {
     assert_eq!(m.f1, 0.0);
 }
 
+/// Canonical cases for the retained `bench::metrics` API.
+/// Re-expressed against the new index-based `evaluate(cps, fix)` shape:
+/// the original epoch-based test mapped CP epoch-distance ≤ window_secs
+/// to TP; here we map CP index-distance ≤ margin to TP. The 5 canonical
+/// cases (perfect, empty, all-FP, mixed, multi-event-hit) all carry over.
 #[test]
 fn evaluate_canonical_cases_from_legacy_f1_with_margin() {
     // Underlying tape: 6 bars at indices 0..6; "events" at indices 1, 3, 5
@@ -97,6 +105,8 @@ fn evaluate_canonical_cases_from_legacy_f1_with_margin() {
     assert!((m.recall - 1.0 / 3.0).abs() < 1e-12);
 }
 
+/// Per-event hit coverage for the retained `bench::metrics` API.
+/// `Metrics::per_event_hit` exposes the same per-event boolean vector.
 #[test]
 fn evaluate_per_event_hit_matches_legacy() {
     // 3 events; 2 CPs that hit events 0 and 1, miss event 2.
@@ -123,6 +133,7 @@ fn evaluate_partial_recall() {
     let m = evaluate(&cps(&[102]), &fix);
     assert_eq!(m.n_events, 3);
     assert_eq!(m.n_cps, 1);
+    // tp=1, fp=0, fn=2 → P=1.0, R=1/3, F1 = 2*1*0.333/(1.333) = 0.5
     assert!((m.precision - 1.0).abs() < 1e-12);
     assert!((m.recall - 1.0 / 3.0).abs() < 1e-12);
     assert!((m.f1 - 0.5).abs() < 1e-12);
@@ -510,6 +521,11 @@ fn hyperliquid_1s_v1_has_above_floor_events() {
         DEFAULT_MIN_EVENTS,
     );
 
+    // (2) Fixture construction: parquet may be absent on CI (the
+    // archive is downloaded out-of-band). Treat as #[ignore] de-facto
+    // by skipping schema assertions, matching the `indices_macro_v1`
+    // pattern. The runtime event-count floor is *not* asserted here:
+    // Runtime clipping depends on the user-supplied dataset window.
     let fix = match FixtureRegistry::hyperliquid_1s_v1(&[]) {
         Ok(f) => f,
         Err(e) => {
@@ -803,6 +819,9 @@ fn per_channel_adapter_with_nig_ar1_prior_runs() {
     assert!(near_shift, "AR(1) per-channel got no CP near GT=150; cps={cps:?}");
 }
 
+/// Smoke test: the joint-no-whitening adapter runs the
+/// recursion via the `per_dim_znorm` path and produces non-empty,
+/// sorted CP output on a 2-channel mean-shift fixture.
 #[test]
 fn joint_znorm_adapter_smoke() {
     use cesura::bench::adapters::BocpdJointZnormAdapter;

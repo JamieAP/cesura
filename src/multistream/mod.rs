@@ -1,16 +1,10 @@
-//! Multi-stream change-point aggregators for cesura.
+//! Multi-stream change-point aggregators.
 //!
-//!
-//! - [`HcAggregator`] -- Higher-Criticism over per-stream scores.
-//!   Sparse-aware (Gong-Kipnis-Xie 2024, arXiv:2409.15597). Output
-//!   includes per-stream attribution so the user knows *which* streams
-//!   crossed the threshold. Optimal when the change is sparse (k of d
-//!   streams shift, k ≪ d, k unknown).
-//!
-//! - [`SumCusumAggregator`] -- sum of per-stream CUSUMs (Mei 2010,
-//!   *Biometrika*). Joint detector, no per-stream attribution. Optimal
-//!   when the change is dense (most streams shift together).
-//!
+//! HcAggregator combines scores using Higher Criticism (Gong, Kipnis, Xie,
+//! arXiv:2409.15597) and includes per-stream attribution.
+//! SumCusumAggregator sums per-stream CUSUMs (Mei, Biometrika 2010).
+//! Both consume ScoreStream implementations. FilterTickAggregator operates
+//! directly on observations with a k-of-d threshold rule.
 
 mod filter_tick;
 mod hc;
@@ -51,6 +45,10 @@ pub enum ScoreKind {
     /// `p = 1 / (1 + score)` (Vovk/Sellke calibration). Sum-CUSUM
     /// neutral reference: 1.0 (BF=1 = equal posterior odds).
     BayesFactor,
+    /// `P(r_t = 0 | y_{1:t})` from the BOCPD recursion (`StreamingDetector`
+    /// with default MAP-drop rule). Range: \[0, 1\]. Illustrative analytic mapping:
+    /// `p = 1 - score`. Sum-CUSUM neutral reference: configurable
+    /// (default 0.005 ≈ implied CP rate for λ ≈ 200).
     CpProbability,
 }
 
@@ -97,7 +95,8 @@ impl ScoreKind {
         }
     }
 
-    ///
+    /// Default thresholds: 20 for Bayes factors, 0.1 for CP probability.
+    /// These are initial settings and do not guarantee a false-alarm rate.
     pub(crate) fn default_sum_cusum_threshold(self) -> f64 {
         match self {
             ScoreKind::BayesFactor => 20.0,

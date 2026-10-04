@@ -57,6 +57,10 @@ fn affine_invariance_per_dim_in_bounded_range() {
 
 #[test]
 fn omega_sweep_keeps_n_finite() {
+    // Probe CP-count sensitivity to `omega` on a synthetic input:
+    // CP counts may be flat or non-monotone -- the assertion is only
+    // that nothing panics or produces NaN regardless of ω across the
+    // sweep range; no CP-count ordering is asserted.
     let data = gen_2d_shift(0x0E0A, 200, 200, 5.0);
     for &omega in &[0.01, 0.05, 0.1, 0.5, 1.0, 5.0] {
         let det = DmBocdDetector::new(2, 100.0, 400).with_omega(omega);
@@ -305,6 +309,12 @@ fn imq_reduces_far_cps_on_heavy_tail_t3() {
 
 #[test]
 fn imq_with_prior_aligned_outliers_pins_st_rcgp_failure_mode() {
+    // ST-RCGP (Laplante-Altamirano-Duncan-Knoblauch-Briol, ICML 2025,
+    // arXiv:2502.02450) identifies a failure mode for constant-c IMQ:
+    // when the prior mean (here: zero, after warmup whitening centers
+    // the data) ALIGNS with the outlier cluster, IMQ down-weights
+    // informative samples instead of noise. This synthetic fixture exercises
+    // that centering failure mode.
     //
     // This test pins it as a regression: on a fixture where the
     // outlier cluster sits near the post-whitening origin and the

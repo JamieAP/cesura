@@ -141,6 +141,9 @@ pub struct BocpdDetector<P: Predictive = Nig> {
     /// EMA of observed inter-CP intervals. `None` until the first
     /// interval is seen; thereafter holds the running mean.
     interval_ema: Option<f64>,
+    /// MAP-drop trigger constants, defaulting to `(3, 30, 15)`.
+    /// Override via [`Self::with_map_drop_trigger`]
+    /// for evaluating trigger sensitivity.
     drop_to: usize,
     min_prev_rl: usize,
     cooldown: usize,
@@ -190,6 +193,11 @@ impl<P: Predictive> BocpdDetector<P> {
         }
     }
 
+    /// Override the MAP-drop trigger constants. Defaults match the
+    /// baseline `(drop_to=3, min_prev_rl=30, cooldown=15)`.
+    /// Currently consumed by `detect_multivariate` and the new
+    /// `detect_multivariate_with_cp_probs`; the univariate `detect`
+    /// path uses the literal constants.
     ///
     /// # Panics
     /// - `min_prev_rl == 0`
@@ -641,6 +649,20 @@ impl<P: Predictive> BocpdDetector<P> {
         (cps, cp_probs, original_indices)
     }
 
+    /// Variant of [`detect`](Self::detect) that returns each emitted CP
+    /// alongside a non-conformity score: the **trigger-to-CP-mass-
+    /// peak offset** `i − argmax_{k ∈ lookback} P(r_k = 0 | y_{1:k}) ≥ 0`.
+    /// The argmax is taken over time `k` at fixed run length `r = 0`
+    /// -- the lookback's "MAP CP-trigger time" per BOCPD's per-step
+    /// run-length-zero posterior. Distinct from the standard MAP
+    /// run length `r* = argmax_r p(r_t = r | y_{1:t})` (Adams &
+    /// MacKay 2007); see `crate::conformal` module docs for the
+    /// score's novelty status, exchangeability assumption, and the
+    /// Bayesian-credible-interval alternative (arXiv:2508.06385).
+    /// Existing `detect()` already uses the same lookback's *value*
+    /// for `confidence`; we surface its *position*. Forward pass
+    /// and emission criteria are bit-for-bit identical to
+    /// `detect()`; only the extra score is surfaced.
     ///
     /// Consumed by [`crate::ConformalCpWrapper`] via the
     /// [`crate::ScoredDetect`] trait.
@@ -823,6 +845,8 @@ impl<P: Predictive> BocpdDetector<P> {
     /// Returns CP indices in the **caller's** input space (non-finite
     /// samples are filtered before the recursion runs).
     ///
+    /// **Status:** opt-in alternative to the default MAP-drop rule.
+    /// Calibration examples are covered by synthetic regression tests.
     pub fn detect_bayes_factor(
         &self,
         data: &[f64],
@@ -1210,6 +1234,9 @@ impl<P: Predictive> BocpdDetector<P> {
     /// Run BOCPD with a Viterbi-style backward decode for change-point
     /// extraction.
     ///
+    /// This offline diagnostic decoder can emit spurious changes when the
+    /// predictive model is misspecified. Validate it separately from the
+    /// default batch MAP-drop rule before choosing a decision rule.
     ///
     /// Equivalent in semantics to `changepoint::utils::map_changepoints`.
     /// `confidence` is `exp(V[t][0] - V_total)`, the marginalised
@@ -1520,6 +1547,9 @@ impl<P: Predictive> BocpdDetector<P> {
             stats = new_stats;
         }
 
+        // MAP run-length drop detection (same logic as univariate).
+        // Trigger constants default to (3, 30, 15), configurable
+        // via Self::with_map_drop_trigger for sensitivity evaluation.
         let drop_to = self.drop_to;
         let min_prev_rl = self.min_prev_rl;
         let cooldown = self.cooldown;
@@ -1582,6 +1612,8 @@ impl<P: Predictive> BocpdDetector<P> {
     /// disabled. Forces the `per_dim_znorm` fallback path always;
     /// otherwise identical to [`Self::detect_multivariate`].
     ///
+    /// Comparing this path with the whitened variant isolates the effect of
+    /// whitening while keeping the posterior recursion unchanged.
     ///
     /// Same `P`-agnostic caveat applies as [`Self::detect_multivariate`]:
     /// the recursion is hard-coded NIW regardless of `P`.
@@ -1748,6 +1780,8 @@ impl<P: Predictive> BocpdDetector<P> {
     /// (duplicate forward pass; bit-for-bit identical recursion to
     /// `detect_multivariate`).
     ///
+    /// Use these diagnostics to compare posterior trajectories and trigger
+    /// behavior on representative fixtures.
     #[cfg(any(test, feature = "test-utils"))]
     pub fn detect_multivariate_with_cp_probs(
         &self,
@@ -2481,6 +2515,11 @@ mod tests {
             .filter(|m| m.category == Category::MustReject)
             .collect();
         let total_fps: usize = mr.iter().map(|m| m.fp).sum();
+        // Baseline without detrending: BOCPD fires on periodic/trending
+        // patterns and (now) on the heavy-tail scenarios where the NIG-Gaussian
+        // predictive under-models tail observations. β-divergence robust BOCPD
+        // is the documented fix for the heavy-tail subset; until it lands, the
+        // floor accommodates the regression floor plus a small margin.
         assert!(
             total_fps <= 22,
             "MustReject total FPs={}, need ≤22",

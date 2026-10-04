@@ -1,5 +1,9 @@
 //! Hand-curated dated macro events for the indices_macro_v1 fixture.
 //!
+//! Format: `(category, label, "YYYY-MM-DD")`. Calendar categories:
+//! `"FOMC" | "CPI" | "NFP" | "ECB" | "BOJ" | "BOE" | "PCE"`. Non-calendar
+//! categories are `"TARIFF" | "AI" | "GEO"`; their dates are hand-curated
+//! rather than derived from official release schedules.
 //!
 //! Sources for calendar events (record on every revision):
 //! - FOMC: <https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm>
@@ -106,6 +110,9 @@ pub const INDICES_MACRO_EVENTS: &[(&str, &str, &str)] = &[
     ("PCE",  "Oct 2025 PCE release",        "2025-11-26"),
     ("PCE",  "Nov 2025 PCE release",        "2025-12-19"),
     ("PCE",  "Dec 2025 PCE release",        "2026-01-30"),
+    // ── Non-calendar (public event annotations) ────────
+    // Tariff / trade-war shocks. Trump admin first-year. Dates are
+    // hand-curated and subject to correction on revision.
     ("TARIFF", "Tariffs announced on MX/CA/CN", "2025-02-01"),
     ("TARIFF", "Liberation Day reciprocal tariffs",  "2025-04-02"),
     ("TARIFF", "90-day tariff pause + 145% China",   "2025-04-09"),

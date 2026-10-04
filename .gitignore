@@ -1,6 +1,12 @@
 /target
 /Cargo.lock
-.claude/worktrees
-
-# Benchmark report output
-bench/results/
+/data/
+/bench/results/
+.claude/
+.env
+.env.*
+*.log
+*.parquet
+*.db
+*.db-wal
+*.db-shm

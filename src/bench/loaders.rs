@@ -1,5 +1,5 @@
 //! Local Parquet/CSV and date helpers for optional evaluation fixtures.
-//! This version uses fixed paths under `data/`; datasets are supplied separately.
+//! Datasets are supplied separately under `data/`; none are bundled here.
 //! Parquet ingestion uses native Polars and may create derived CSVs in /tmp.
 
 use std::fs;
@@ -21,22 +21,9 @@ pub const INDICES_PARQUET_DIR: &str =
 /// 4 streams: SPX (large-cap), NDX (tech), DJI (industrials), VIX (vol).
 pub const INDICES_DEFAULT_SYMBOLS: &[&str] = &["I:SPX", "I:NDX", "I:DJI", "I:VIX"];
 
-/// Directory of per-day Hydromancer Reservoir parquets for Hyperliquid
-/// 1s OHLCV. Layout: `<dir>/date=YYYY-MM-DD/candles.parquet`. Files are
-/// downloaded ahead-of-time via:
-///
-/// ```bash
-/// aws s3 cp \
-///   s3://hydromancer-reservoir/by_dex/hyperliquid/candles/1s/date=YYYY-MM-DD/candles.parquet \
-///   <dir>/date=YYYY-MM-DD/candles.parquet \
-///   --request-payer requester --region ap-northeast-1
-/// ```
-///
-/// Expected source schema:
-///   `coin: string, dex: string, asset_class: string ∈ {perp, spot},
-///    base_symbol, quote_symbol, timestamp: timestamp[ms,UTC],
-///    open/high/low/close/volume/volume_quote: decimal128(20,10),
-///    trade_count: uint32`.
+/// Directory of per-day 1-second OHLCV Parquet files.
+/// Layout: `<dir>/date=YYYY-MM-DD/candles.parquet`.
+/// Expected columns include coin, asset_class, timestamp, close, and volume.
 pub const HYPERLIQUID_PARQUET_DIR: &str =
     "data/hyperliquid_1s";
 
@@ -197,6 +184,11 @@ pub fn align_assets(per_asset: &[AssetSeries], _d: usize) -> (Vec<i64>, Vec<Vec<
 /// `timestamp // 3_600_000`, then `log().diff()`. Returns one
 /// `AssetSeries` per symbol in input order.
 ///
+/// Parquet schema is `timestamp:int64(ms), symbol:str, close:float64`
+/// (open/high/low present but unused). Uses polars-lazy: the
+/// filter+group-by happens at scan time so cold-load is bounded by
+/// the per-day file count (~293 files × 22K rows each as of
+/// 2026-02-13). Single in-process pass; no subprocess.
 pub fn load_indices_1m(symbols: &[&str]) -> Result<Vec<AssetSeries>, FixtureError> {
     use polars::prelude::*;
     if symbols.is_empty() {
@@ -308,6 +300,10 @@ pub fn load_indices_1m(symbols: &[&str]) -> Result<Vec<AssetSeries>, FixtureErro
     Ok(out)
 }
 
+/// Load 1s log-returns for each requested Hyperliquid perp coin from
+/// the local Hydromancer Reservoir parquet store. Forward-fills missing
+/// seconds (Hydromancer emits only seconds with trades) so the returned
+/// tape is dense at one-second resolution for fixture alignment.
 ///
 /// Reads every `<dir>/date=YYYY-MM-DD/candles.parquet` it finds,
 /// concatenates, filters `coin == sym AND asset_class == "perp"`,
@@ -488,6 +484,9 @@ pub fn log_diff(closes: &[f64]) -> Vec<f64> {
 mod tests {
     use super::*;
 
+    /// Check ISO-date parsing against known Unix-time references.
+    /// Pin Howard Hinnant's days_from_civil algorithm against KNOWN_EVENTS dates
+    /// and the Jan/Feb branch boundary (off-by-one risk).
     #[test]
     fn parse_iso_date_matches_unix_reference() {
         assert_eq!(parse_iso_date("1970-01-01"), 0);

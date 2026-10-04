@@ -193,6 +193,12 @@ mod tests {
 
     #[test]
     fn lambda_n_basic_properties() {
+        // λ_n = √n / log(n)² is non-monotone in finite r: it dips
+        // around r ∈ [20, 60] before climbing again as √r dominates.
+        // Test the load-bearing properties only:
+        //   (a) finite + positive for r ≥ 2;
+        //   (b) zero at the degenerate r < 2;
+        //   (c) asymptotic growth: λ(10000) > λ(100).
         let small = lambda_n(20, 1.0);
         let large = lambda_n(10000, 1.0);
         assert!(small.is_finite() && small > 0.0);

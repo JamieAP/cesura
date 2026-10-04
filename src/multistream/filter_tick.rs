@@ -1,7 +1,8 @@
-//! `FilterTickAggregator` -- k-of-d threshold detector primitive.
+//! Direct k-of-d threshold detector.
 //!
-//!
-//!
+//! Counts streams with absolute observations above a threshold and fires when
+//! at least k qualify and the cooldown has elapsed. It does not use BOCPD.
+//! NaN observations are excluded from the active count.
 
 use serde::{Deserialize, Serialize};
 
@@ -30,6 +31,10 @@ pub struct FilterTickAggregatorState {
 }
 
 impl FilterTickAggregator {
+    /// Construct a filter-tick aggregator over `d` streams. Fires when
+    /// `≥ k` streams have `|observation| > threshold` in one step.
+    /// Default cooldown 15 steps (matches `SumCusumAggregator` tick
+    /// default).
     ///
     /// # Panics
     /// - `d == 0` or `k == 0`

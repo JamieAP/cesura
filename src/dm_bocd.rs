@@ -1,23 +1,10 @@
-//! Diffusion-Score-Matching BOCD (Altamirano-Briol-Knoblauch ICML 2023,
-//! arXiv:2302.04759). Multivariate, mean-only "Path A_min" first cut.
+//! Diffusion-Score-Matching BOCD (Altamirano, Briol, Knoblauch, ICML 2023,
+//! arXiv:2302.04759). Multivariate, mean-only detector.
 //!
-//! ## What this ships
-//!
-//! Closed-form generalised-Bayes-via-DSM posterior on the Gaussian mean
-//! parameter, with constant `m = I_d` weight (no Prop 3.2 robustness).
-//! Observation noise covariance is estimated from a warmup window and
-//! held fixed -- observations are Cholesky-whitened so the Dm streaming
-//! update of Appendix B.3 reduces to:
-//!
-//! ```text
-//! Σ_{T+1}⁻¹ = Σ_T⁻¹ + 2ω · I
-//! μ_{T+1}   = Σ_{T+1} · (Σ_T⁻¹ μ_T + 2ω · x_{T+1})
-//! ```
-//!
-//! Run-length recursion + MAP-drop trigger mirror
-//! [`BocpdDetector::detect_multivariate`]; the only difference is the
-//! per-segment predictive (Dm-posterior here vs NIW posterior there).
-//!
+//! Observation covariance is estimated during warmup and held fixed.
+//! The default identity-weight posterior update operates on whitened values;
+//! pluggable MWeight kernels and StreamingDmBocd are also available.
+//! Omega requires calibration; joint mean/covariance updates are not provided.
 
 use crate::bocpd::{cholesky_lower, forward_solve, per_dim_znorm, whitening_transform};
 use crate::conformal::MvScoredDetect;
@@ -133,10 +120,14 @@ impl MWeight for IdentityM {
 /// Prop 3.2 globally bias-robust choice. `c` controls bandwidth:
 /// smaller `c` ⇒ more aggressive downweighting of large `‖x‖`.
 ///
-/// # Known failure mode (centering / bandwidth selection)
+/// # Centering and bandwidth
 ///
-///
-///
+/// A fixed kernel centered on the warmup mean can downweight informative
+/// samples after a structural break. AdaptiveImqM uses run-length-conditional
+/// predictive moments instead. See Laplante et al. (ICML 2025),
+/// [arXiv:2502.02450](https://arxiv.org/abs/2502.02450).
+/// IMQ is this implementation's kernel choice; it differs from the reference
+/// paper's hand-tuned synthetic kernel.
 pub struct ImqM {
     /// Bandwidth. Smaller ⇒ more aggressive downweighting.
     pub c: f64,
@@ -292,6 +283,13 @@ impl MWeight for AdaptiveImqM {
 ///
 /// Construction via [`Self::new`] needs no type annotations:
 ///
+/// ```
+/// use cesura::DmBocdDetector;
+/// // No turbofish, no `: DmBocdDetector<IdentityM>` ascription.
+/// let det = DmBocdDetector::new(2, 100.0, 200);
+/// let data: Vec<Vec<f64>> = (0..30).map(|_| vec![0.0, 0.0]).collect();
+/// let _ = det.detect_multivariate(&data);
+/// ```
 ///
 /// This works because `new` lives on the inherent impl
 /// `impl DmBocdDetector<IdentityM>`, pinning `M = IdentityM` at
@@ -383,6 +381,12 @@ impl<M: MWeight> DmBocdDetector<M> {
         }
     }
 
+    /// Override the MAP-drop trigger constants. Defaults are
+    /// `(drop_to=3, min_prev_rl=30, cooldown=15)`, matching the
+    /// hand-tuned values in [`crate::BocpdDetector::detect_multivariate`].
+    /// Use this to sweep the trigger and
+    /// distinguish "Dm posterior never accumulates to `min_prev_rl`"
+    /// from "trigger constants are too strict for heavy-tailed input".
     ///
     /// # Panics
     /// - `min_prev_rl == 0`
@@ -404,6 +408,11 @@ impl<M: MWeight> DmBocdDetector<M> {
         self
     }
 
+    /// Set the generalised-Bayes weight. Higher `omega` puts more weight
+    /// on the data relative to the prior. The paper's §3.4 calibration
+    /// procedure picks `omega` by minimising KL between the DSM
+    /// posterior and the standard-Bayes posterior on a warmup window;
+    /// that calibration is not implemented here. The caller supplies `omega`.
     pub fn with_omega(mut self, omega: f64) -> Self {
         assert!(omega > 0.0, "omega must be > 0, got {omega}");
         self.omega = omega;
@@ -614,10 +623,18 @@ impl<M: MWeight> DmBocdDetector<M> {
         result
     }
 
+    /// Diagnostic variant of [`Self::detect_multivariate`]: returns
+    /// `(cps, cp_probs, map_rls)` -- the per-step `P(r_t = 0)` and MAP
+    /// run-length arrays alongside the emitted change points. Mirrors
+    /// [`crate::BocpdDetector::detect_with_cp_probs`]'s duplicate-
+    /// forward-pass convention so that `detect_multivariate` stays
+    /// bit-for-bit identical to the default trigger baseline.
     ///
     /// `cp_probs` and `map_rls` have length `n` (or `0` when input is
     /// rejected via the same checks `detect_multivariate` applies).
     ///
+    /// Use the trajectories to distinguish numerical behavior from trigger
+    /// behavior on synthetic or user-supplied fixtures.
     #[cfg(any(test, feature = "test-utils"))]
     pub fn detect_multivariate_with_diagnostics(
         &self,
@@ -785,6 +802,7 @@ impl MvScoredDetect for DmBocdDetector {
     }
 }
 
+// ── Streaming wrapper ───────────────────────────────────────────────
 //
 // Mirrors `crate::streaming::StreamingDetector` for the BOCPD path.
 // Owns one batch-equivalent forward sweep + a 20-bar lookahead buffer
@@ -1296,6 +1314,19 @@ impl DmStats {
         Self { mu: mu.to_vec(), sigma_inv: sigma_inv.to_vec() }
     }
 
+    /// Streaming Dm update with configurable `m`-function on whitened
+    /// obs (Prop 3.1, constant-in-θ form):
+    /// ```text
+    /// A(x) = m(x) m(x)^T          # d×d
+    /// b(x) = ∇·(m m^T)(x)         # d
+    /// Σ⁻¹_new = Σ⁻¹ + 2ω·A(x)
+    /// rhs     = Σ⁻¹ μ + 2ω·(A(x) x − 0.5·b(x))
+    /// μ_new   = solve(Σ⁻¹_new, rhs)
+    /// ```
+    /// When `m_weight.is_identity()`, the implementation skips the
+    /// generic matmul and uses the identity-weight fast path
+    /// (`A = I`, `b = 0`); the resulting bytes match bit-for-bit
+    /// (regression-pinned).
     fn update<M: MWeight + ?Sized>(&self, x: &[f64], omega: f64, m_weight: &M) -> Self {
         let d = self.mu.len();
         let two_omega = 2.0 * omega;

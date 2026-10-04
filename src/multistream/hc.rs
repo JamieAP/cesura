@@ -105,6 +105,10 @@ pub struct HcAggregator<S: ScoreStream> {
     /// rank windows have enough samples for stable empirical CDF.
     /// Default 100.
     warmup: usize,
+    /// Persistence filter: require HC > threshold for `persistence`
+    /// CONSECUTIVE steps before firing. Filters transient single-step
+    /// noise excursions in heavy-tailed BOCPD output. Default 2
+    /// Larger values require sustained above-threshold evidence.
     persistence: usize,
     armed: bool,
     last_emit: Option<usize>,
@@ -182,18 +186,13 @@ impl<S: ScoreStream> HcAggregator<S> {
         Self {
             streams,
             score_kind: kind,
-            // Default τ=3.0 calibrated against rank-transform
-            // p-values: integration tests against StreamingDetector
-            // (BF mode and CpProbability mode) fire on 1-of-4 5σ
-            // sparse shifts and do not fire on stationary 300-step
-            // tapes. HC asymptotic 95th percentile under H_0 for
-            // d ∈ [3..5] is ≈ √(2 log log d) ≈ 1.5; τ=3.0 leaves
-            // headroom for finite-sample p-value variance.
+            // Initial threshold; calibrate for the stream count and score mapping.
             threshold: 3.0,
             cooldown: 15,
             // warmup = rank window capacity so the empirical CDF is
             // populated from a full window before HC fires.
             warmup: 100,
+            // Require two consecutive above-threshold steps to suppress brief spikes.
             persistence: 2,
             armed: false,
             last_emit: None,
@@ -234,9 +233,8 @@ impl<S: ScoreStream> HcAggregator<S> {
     /// Persistence filter: require HC > threshold for `n` consecutive
     /// steps before firing. Default 2.
     ///
-    ///
-    ///
-    ///
+    /// Larger persistence suppresses brief spikes but can delay or miss changes.
+    /// Calibrate jointly with the threshold and rank-window capacity.
     ///
     /// # Panics
     /// Panics if `n == 0`.

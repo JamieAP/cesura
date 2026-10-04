@@ -1,4 +1,8 @@
+//! Guard against duplicated legacy helpers.
 //!
+//! Fails if any file under `examples/` defines a function with one of
+//! the dedup'd helper names. Acceptance criterion: each helper appears
+//! exactly once in the codebase, in `src/bench/`.
 //!
 //! The forbidden names are also forbidden as `const KNOWN_EVENTS` /
 //! `static PREPARE_*` shadows, since those carry the same dedup
@@ -74,8 +78,18 @@ fn examples_have_no_dedup_helpers() {
     );
 }
 
+/// No example may hand-type a verdict-label
+/// string. Use [`label_str(VerdictLabel::*)`] from `src/bench/harness.rs`
+/// so the renderer is the single source of truth. Catches the regression
+/// where `dm_bocd_eval.rs` had a local `let label_str = match
+/// verdict.label { VerdictLabel::VerdictGrade => "verdict-grade", ... }`
+/// that shadowed the imported helper.
 #[test]
 fn no_handtyped_verdict_strings_in_examples() {
+    // Forbidden: matching any VerdictLabel variant to a hand-typed
+    // string. The pattern grep is `VerdictLabel::<Variant> =>` -- this
+    // appears in the canonical `label_str` impl in `src/bench/harness.rs`
+    // but should NEVER appear in `examples/`.
     const FORBIDDEN_PATTERNS: &[&str] = &[
         "VerdictLabel::VerdictGrade =>",
         "VerdictLabel::SanityCheck =>",

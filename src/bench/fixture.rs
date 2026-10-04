@@ -106,6 +106,8 @@ use crate::bench::loaders::{
 };
 use crate::eval::{all_scenarios, heavy_tail_scenarios, Rng, Scenario};
 
+/// Five labelled public market events for optional data fixtures.
+/// Sanity-check fixture only -- 5 events fail the 50-event verdict floor.
 pub const KNOWN_EVENTS: &[(&str, &str)] = &[
     ("SVB / USDC depeg", "2023-03-10"),
     ("Binance/CFTC suit", "2023-03-27"),
@@ -135,6 +137,10 @@ impl FixtureRegistry {
             .collect()
     }
 
+    /// BTC/ETH/SOL hourly log-returns aligned by epoch + 5 KNOWN_EVENTS
+    /// projected to indices via nearest-bar lookup. `margin` is the
+    /// 48-hour window converted to bars (48 indices on hourly data).
+    /// Always classifies as `SanityCheck` under the verdict floor.
     pub fn crypto_macro_5() -> Result<Fixture, FixtureError> {
         prepare_real_csvs()?;
         let mut per_asset: Vec<AssetSeries> = Vec::new();
@@ -241,6 +247,12 @@ impl FixtureRegistry {
 
         let data = step_shift_inject(&base.data, &chosen, sigma, &sigmas);
 
+        // ground_truth must include the native KNOWN_EVENTS
+        // indices alongside the synthetic injections. Otherwise F1 on the
+        // injected fixture is not apples-to-apples with F1 on the native
+        // crypto_macro_5 (different ground-truth definitions). Reuse the
+        // base fixture's native CP indices (already projected to bars by
+        // crypto_macro_5).
         let mut ground_truth: Vec<usize> = base.ground_truth.clone();
         ground_truth.extend(chosen);
         ground_truth.sort_unstable();
@@ -327,12 +339,11 @@ impl FixtureRegistry {
     /// nearest-bar lookup; events outside the available parquet window
     /// are dropped at clip time.
     ///
-    /// Tape source: Hydromancer Reservoir 1s candles (parquet), stored
-    /// under [`crate::bench::loaders::HYPERLIQUID_PARQUET_DIR`].
-    /// Forward-filled to a dense 1s grid in the loader so margin maps
-    /// cleanly to wall-clock seconds.
-    ///
-    ///
+    /// The caller supplies local Parquet files under the loader's configured
+    /// dataset directory. The loader forward-fills a dense one-second grid.
+    /// This fixture uses a 60-observation matching margin. Events outside the
+    /// available data window are clipped; the remaining count determines
+    /// whether the generic evaluation floor is met.
     pub fn hyperliquid_1s_v1(symbols: &[&str]) -> Result<Fixture, FixtureError> {
         let symbols: Vec<&str> = if symbols.is_empty() {
             HYPERLIQUID_DEFAULT_SYMBOLS.to_vec()
@@ -377,6 +388,10 @@ impl FixtureRegistry {
         })
     }
 
+    /// Anomaly-injected indices variant: same step-shift logic as
+    /// [`Self::anomaly_injected_crypto`], but on the indices fixture.
+    /// Ground truth combines the requested injected events with native
+    /// `INDICES_MACRO_EVENTS` present in the loaded data.
     pub fn anomaly_injected_indices(
         symbols: &[&str],
         seed: u64,
@@ -387,6 +402,9 @@ impl FixtureRegistry {
         let n = base.data.len();
         let d = base.d;
         let epochs = base.epochs.as_ref().expect("indices_macro_v1 has epochs");
+        // Exclude injection locations within one calendar day of native
+        // macro events. This fixture buffer is a heuristic and should be
+        // reconsidered for the intended data and injection schedule.
         let buffer = 86_400i64;
 
         let event_epochs: Vec<i64> = INDICES_MACRO_EVENTS
@@ -403,6 +421,9 @@ impl FixtureRegistry {
         }
 
         let mut rng = Rng::new(seed);
+        // 8 hourly RTH bars ≈ 1 trading day of separation between
+        // adjacent injections. Tighter than the crypto fixture's 24h
+        // because session structure already imposes natural gaps.
         let min_sep = 8usize;
         let mut chosen: Vec<usize> = Vec::with_capacity(n_inj);
         let mut attempts = 0usize;
@@ -430,6 +451,10 @@ impl FixtureRegistry {
 
         let data = step_shift_inject(&base.data, &chosen, sigma, &sigmas);
 
+        // ground_truth must include the native
+        // INDICES_MACRO_EVENTS indices alongside the synthetic injections.
+        // Otherwise F1 on the injected fixture is not apples-to-apples with
+        // F1 on the native indices_macro_v1 fixture.
         let mut ground_truth: Vec<usize> = base.ground_truth.clone();
         ground_truth.extend(chosen);
         ground_truth.sort_unstable();

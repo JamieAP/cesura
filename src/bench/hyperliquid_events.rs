@@ -1,16 +1,7 @@
-//! Hand-curated dated events for the `hyperliquid_1s_v1` fixture.
-//!
-//! Mirrors the shape of `INDICES_MACRO_EVENTS` (string-tagged tuples).
-//! Category tags follow the indices set verbatim for the MACRO subset
-//! (FOMC/CPI/NFP/ECB/BOJ/BOE/PCE + non-calendar TARIFF/AI/GEO). New
-//! crypto-specific tags planned for v2:
-//!
-//!
-//! Window covered: 2025-01 → 2026-02 (matches `INDICES_MACRO_EVENTS`).
-//! The Hydromancer Reservoir parquet archive starts 2025-07-31; events
-//! outside the available data window are clipped at fixture-construction
-//! time (same pattern as `indices_macro_v1`).
-//!
+//! Dated public macro events for optional one-second market fixtures.
+//! Events outside a supplied dataset window are clipped during construction.
+//! Datasets are supplied separately; the static index does not establish
+//! detector quality or a minimum runtime event count.
 
 pub const HYPERLIQUID_EVENTS_V1_VERSION: u32 = 1;
 
@@ -99,7 +90,7 @@ pub const HYPERLIQUID_EVENTS_V1: &[(&str, &str, &str)] = &[
     ("PCE",  "Oct 2025 PCE release",        "2025-11-26"),
     ("PCE",  "Nov 2025 PCE release",        "2025-12-19"),
     ("PCE",  "Dec 2025 PCE release",        "2026-01-30"),
-    // Non-calendar events mirror INDICES_MACRO_EVENTS.
+    // Non-calendar public events.
     ("TARIFF", "Tariffs announced on MX/CA/CN",       "2025-02-01"),
     ("TARIFF", "Liberation Day reciprocal tariffs",   "2025-04-02"),
     ("TARIFF", "90-day tariff pause + 145% China",    "2025-04-09"),
@@ -115,6 +106,7 @@ pub const HYPERLIQUID_EVENTS_V1: &[(&str, &str, &str)] = &[
     ("GEO", "Iran-Israel ceasefire",             "2025-06-24"),
 ];
 
+/// Number of static public-event entries. Runtime clipping may lower the count.
 pub const HYPERLIQUID_EVENTS_V1_COUNT: usize = HYPERLIQUID_EVENTS_V1.len();
 
 const _: () = assert!(

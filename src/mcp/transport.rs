@@ -1,5 +1,8 @@
 //! Resilient stdio transport for `cesura-mcp`.
 //!
+//! Wraps `tokio::io::stdin/stdout` with a line-framed JSON-RPC loop
+//! that, on a malformed frame, emits a `-32700 Parse error` reply and
+//! keeps the channel open instead of terminating it.
 
 use std::marker::PhantomData;
 use std::sync::Arc;
